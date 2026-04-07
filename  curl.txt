@@ -1,0 +1,6 @@
+curl -X POST "https://ai.gk-osnova.ru/api/v1/auths/signin" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "email": "ВАШ_ЛОГИН_ИЛИ_EMAIL",
+    "password": "ВАШ_ПАРОЛЬ"
+  }'

@@ -1,0 +1,483 @@
+"""
+RAG сервис v3.5 — production pipeline
+- Query rewrite (1 LLM вызов перед поиском)
+- Hybrid search (vector + keyword)
+- ChromaDB + LlamaIndex SentenceSplitter
+- Все эндпоинты для 1С
+- Защита от галлюцинаций
+"""
+
+import os
+import re
+import logging
+import asyncio
+from pathlib import Path
+from typing import Optional
+from contextlib import asynccontextmanager
+from datetime import datetime
+
+import httpx
+from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks
+from fastapi.responses import FileResponse
+from pydantic import BaseModel
+
+OLLAMA_BASE_URL    = os.getenv("OLLAMA_BASE_URL",    "http://localhost:11434")
+OLLAMA_LLM_MODEL   = os.getenv("OLLAMA_LLM_MODEL",   "llama3.1")
+OLLAMA_EMBED_MODEL = os.getenv("OLLAMA_EMBED_MODEL",  "bge-m3")
+STORAGE_DIR        = Path(os.getenv("STORAGE_DIR",    "./storage"))
+FILES_DIR          = STORAGE_DIR / "files"
+CHROMA_DIR         = STORAGE_DIR / "chroma"
+TOP_K              = int(os.getenv("TOP_K",           "3"))
+CHUNK_SIZE         = int(os.getenv("CHUNK_SIZE",      "800"))
+CHUNK_OVERLAP      = int(os.getenv("CHUNK_OVERLAP",   "120"))
+BASE_URL           = os.getenv("BASE_URL",            "http://localhost:8000")
+SIM_THRESHOLD      = float(os.getenv("SIM_THRESHOLD", "0.65"))
+
+# Chroma expects TRUE/FALSE (uppercase). Wrong casing may keep telemetry enabled.
+os.environ["ANONYMIZED_TELEMETRY"] = "FALSE"
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger(__name__)
+
+STORAGE_DIR.mkdir(exist_ok=True)
+FILES_DIR.mkdir(exist_ok=True)
+CHROMA_DIR.mkdir(exist_ok=True)
+
+SUPPORTED = {".pdf", ".docx", ".txt", ".md"}
+
+_chroma_collection = None
+_indexing: dict[str, dict] = {}
+_indexing_locks: dict[str, asyncio.Lock] = {}
+
+
+def _get_collection():
+    global _chroma_collection
+    if _chroma_collection is None:
+        import chromadb
+        client = chromadb.PersistentClient(path=str(CHROMA_DIR))
+        _chroma_collection = client.get_or_create_collection(
+            name="documents",
+            metadata={"hnsw:space": "cosine"}
+        )
+        log.info(f"ChromaDB: {_chroma_collection.count()} chunks")
+    return _chroma_collection
+
+
+async def _embed(text: str):
+    async with httpx.AsyncClient(timeout=120) as c:
+        r = await c.post(
+            f"{OLLAMA_BASE_URL}/api/embed",
+            json={"model": OLLAMA_EMBED_MODEL, "input": text},
+        )
+        if r.status_code == 400:
+            return None
+        r.raise_for_status()
+        data = r.json()
+        emb = data["embeddings"]
+        return emb[0] if isinstance(emb[0], list) else emb
+
+
+async def _chat(messages: list[dict]) -> str:
+    async with httpx.AsyncClient(timeout=600) as c:
+        r = await c.post(
+            f"{OLLAMA_BASE_URL}/api/chat",
+            json={
+                "model": OLLAMA_LLM_MODEL,
+                "messages": messages,
+                "stream": False,
+                "think": False,
+                "options": {
+                    "temperature": 0.0,
+                    "top_p": 0.85,
+                    "top_k": 30,
+                    "repeat_penalty": 1.15,
+                    "num_ctx": 8192
+                }
+            },
+        )
+        r.raise_for_status()
+        content = r.json().get("message", {}).get("content", "")
+        if not content:
+            raise ValueError("LLM вернул пустой ответ")
+        return content
+
+
+async def _rewrite_query(q: str) -> str:
+    try:
+        r = await _chat([
+            {
+                "role": "system",
+                "content": (
+                    "Переформулируй запрос для поиска по техническим документам. "
+                    "Добавь синонимы и ключевые термины. "
+                    "Ответ — одна строка без пояснений."
+                )
+            },
+            {"role": "user", "content": q}
+        ])
+        rewritten = r.strip()
+        log.info(f"Query rewrite: {q!r} -> {rewritten!r}")
+        return rewritten
+    except Exception as e:
+        log.warning(f"rewrite failed: {e}")
+        return q
+
+
+async def _run_indexing(filename: str, dest: Path):
+    lock = _indexing_locks.setdefault(filename, asyncio.Lock())
+    async with lock:
+        _indexing[filename] = {
+            "status": "indexing", "chunks_done": 0, "chunks_total": 0,
+            "error": None, "started_at": datetime.utcnow().isoformat(), "finished_at": None,
+        }
+        try:
+            from llama_index.core import SimpleDirectoryReader
+            from llama_index.core.node_parser import SentenceSplitter
+
+            loop = asyncio.get_event_loop()
+            docs = await loop.run_in_executor(
+                None,
+                lambda: SimpleDirectoryReader(input_files=[str(dest)]).load_data()
+            )
+            if not docs:
+                raise ValueError("No text extracted from file")
+
+            splitter = SentenceSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
+            nodes = await loop.run_in_executor(
+                None,
+                lambda: splitter.get_nodes_from_documents(docs)
+            )
+
+            total = len(nodes)
+            _indexing[filename]["chunks_total"] = total
+            log.info(f"[{filename}] {total} chunks (SentenceSplitter)")
+
+            collection = _get_collection()
+            try:
+                existing = collection.get(where={"filename": filename})
+                if existing["ids"]:
+                    collection.delete(ids=existing["ids"])
+            except Exception:
+                pass
+
+            done = 0
+            for i, node in enumerate(nodes):
+                text = node.text.strip()
+                if not text:
+                    continue
+                emb = await _embed(text)
+                if emb is None:
+                    log.warning(f"[{filename}] skipping chunk {i} (embed 400)")
+                    continue
+                collection.add(
+                    ids=[f"{filename}_{i}"],
+                    embeddings=[emb],
+                    documents=[text],
+                    metadatas=[{"filename": filename}]
+                )
+                done += 1
+                _indexing[filename]["chunks_done"] = done
+                if done % 20 == 0:
+                    log.info(f"[{filename}] {done}/{total}")
+
+            _indexing[filename].update({
+                "status": "ready", "chunks_done": done,
+                "finished_at": datetime.utcnow().isoformat(),
+            })
+            log.info(f"[{filename}] done: {done} chunks")
+
+        except Exception as e:
+            log.error(f"[{filename}] failed: {e}")
+            _indexing[filename].update({
+                "status": "error", "error": str(e),
+                "finished_at": datetime.utcnow().isoformat(),
+            })
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    _get_collection()
+    yield
+
+app = FastAPI(title="RAG Ollama API v3.5", version="3.5.0", lifespan=lifespan)
+
+
+class AskRequest(BaseModel):
+    question: str
+    top_k: Optional[int] = None
+
+class AskResponse(BaseModel):
+    answer: str
+    sources: list[str]
+    chunks_used: int
+    download_urls: dict[str, str]
+    raw_chunks: list[str]
+
+class UploadResponse(BaseModel):
+    filename: str
+    status: str
+
+class DocumentInfo(BaseModel):
+    filename: str
+    chunks: int
+    indexing_status: str
+    download_url: str
+
+class IndexingStatus(BaseModel):
+    filename: str
+    status: str
+    chunks_done: int
+    chunks_total: int
+    progress_pct: float
+    error: Optional[str]
+    started_at: Optional[str]
+    finished_at: Optional[str]
+
+class StatusResponse(BaseModel):
+    total_chunks: int
+    total_documents: int
+    llm_model: str
+    embed_model: str
+    ollama_url: str
+
+
+@app.get("/status", response_model=StatusResponse)
+async def status():
+    col = _get_collection()
+    total = col.count()
+    results = col.get()
+    docs = len({m["filename"] for m in results["metadatas"]}) if results["metadatas"] else 0
+    return StatusResponse(
+        total_chunks=total, total_documents=docs,
+        llm_model=OLLAMA_LLM_MODEL, embed_model=OLLAMA_EMBED_MODEL,
+        ollama_url=OLLAMA_BASE_URL,
+    )
+
+@app.get("/documents", response_model=list[DocumentInfo])
+async def list_documents():
+    col = _get_collection()
+    results = col.get()
+    counts: dict[str, int] = {}
+    for m in (results["metadatas"] or []):
+        fn = m["filename"]
+        counts[fn] = counts.get(fn, 0) + 1
+    for fn in _indexing:
+        counts.setdefault(fn, 0)
+    result = []
+    for fn, n in sorted(counts.items()):
+        st = _indexing.get(fn, {}).get("status", "ready" if n > 0 else "unknown")
+        result.append(DocumentInfo(
+            filename=fn, chunks=n, indexing_status=st,
+            download_url=f"{BASE_URL}/documents/{fn}/download",
+        ))
+    return result
+
+@app.post("/documents", response_model=UploadResponse, status_code=202)
+async def upload_document(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+    suffix = Path(file.filename).suffix.lower()
+    if suffix not in SUPPORTED:
+        raise HTTPException(400, f"Unsupported type '{suffix}'. Supported: {', '.join(sorted(SUPPORTED))}")
+    if _indexing.get(file.filename, {}).get("status") == "indexing":
+        raise HTTPException(409, f"'{file.filename}' is already being indexed")
+    dest = FILES_DIR / file.filename
+    dest.write_bytes(await file.read())
+    background_tasks.add_task(_run_indexing, file.filename, dest)
+    return UploadResponse(filename=file.filename, status="indexing_started")
+
+@app.get("/documents/{filename}/download")
+async def download_document(filename: str):
+    path = FILES_DIR / filename
+    if not path.exists():
+        raise HTTPException(404, f"File '{filename}' not found")
+    return FileResponse(path, filename=filename)
+
+@app.get("/documents/{filename}/status", response_model=IndexingStatus)
+async def document_status(filename: str):
+    info = _indexing.get(filename)
+    if info is None:
+        col = _get_collection()
+        results = col.get(where={"filename": filename})
+        chunks = len(results["ids"])
+        if chunks:
+            return IndexingStatus(
+                filename=filename, status="ready",
+                chunks_done=chunks, chunks_total=chunks,
+                progress_pct=100.0, error=None,
+                started_at=None, finished_at=None,
+            )
+        raise HTTPException(404, f"Document '{filename}' not found")
+    total = info["chunks_total"] or 1
+    return IndexingStatus(
+        filename=filename,
+        status=info["status"],
+        chunks_done=info["chunks_done"],
+        chunks_total=info["chunks_total"],
+        progress_pct=round(info["chunks_done"] / total * 100, 1),
+        error=info.get("error"),
+        started_at=info.get("started_at"),
+        finished_at=info.get("finished_at"),
+    )
+
+@app.delete("/documents/{filename}")
+async def delete_document(filename: str):
+    if _indexing.get(filename, {}).get("status") == "indexing":
+        raise HTTPException(409, f"'{filename}' is currently being indexed")
+    col = _get_collection()
+    results = col.get(where={"filename": filename})
+    if not results["ids"]:
+        raise HTTPException(404, f"Document '{filename}' not found in index")
+    col.delete(ids=results["ids"])
+    (FILES_DIR / filename).unlink(missing_ok=True)
+    _indexing.pop(filename, None)
+    return {"filename": filename, "chunks_removed": len(results["ids"])}
+
+@app.post("/ask", response_model=AskResponse)
+async def ask(req: AskRequest):
+    col = _get_collection()
+    if col.count() == 0:
+        raise HTTPException(503, "Index is empty. Upload documents first via POST /documents")
+
+    top_k = req.top_k or TOP_K
+
+    # 1. Query rewrite
+    rewritten = await _rewrite_query(req.question)
+    rewritten = rewritten.replace('"', '')
+    # Убираем нелатинские/некириллические символы (китайский и т.д.)
+    rewritten = re.sub(r'[^-ɏЀ-ӿ\s]', '', rewritten).strip()
+    # Для поиска используем оригинальный вопрос — rewrite может добавлять мусор
+    search_query = req.question
+
+    # 2. Векторный поиск
+    try:
+        q_emb = await _embed(search_query)
+        if q_emb is None:
+            raise ValueError("embed returned None")
+    except Exception as e:
+        raise HTTPException(502, f"Ollama embed error: {e}")
+
+    results = col.query(
+        query_embeddings=[q_emb],
+        n_results=min(top_k, col.count()),
+        include=["documents", "metadatas", "distances"]
+    )
+
+    docs      = results["documents"][0]
+    metas     = results["metadatas"][0]
+    distances = results["distances"][0]
+
+    if not docs:
+        return AskResponse(
+            answer="Информация в документах не найдена.",
+            sources=[], chunks_used=0, download_urls={}, raw_chunks=[]
+        )
+
+    best_sim = 1 - distances[0] / 2
+    log.info(f"Best similarity: {best_sim:.3f}")
+    if best_sim < SIM_THRESHOLD:
+        return AskResponse(
+            answer="Информация в документах не найдена.",
+            sources=[], chunks_used=0, download_urls={}, raw_chunks=[]
+        )
+
+    # 3. Ключевой поиск
+    question_words = [w.lower()[:5] for w in req.question.split() if len(w) > 4]
+    found_ids = set(results["ids"][0])
+    all_chunks = col.get(limit=500)
+
+    kw_pairs = sorted(
+        [
+            (doc, meta)
+            for doc, meta, id_ in zip(
+                all_chunks["documents"], all_chunks["metadatas"], all_chunks["ids"]
+            )
+            if id_ not in found_ids
+            and any(w in doc.lower() for w in question_words)
+        ],
+        key=lambda x: sum(1 for w in question_words if w in x[0].lower()),
+        reverse=True
+    )[:top_k]
+
+    keyword_hits_docs  = [p[0] for p in kw_pairs]
+    keyword_hits_metas = [p[1] for p in kw_pairs]
+
+    all_docs  = list(docs) + keyword_hits_docs
+    all_metas = list(metas) + keyword_hits_metas
+
+    context = "\n\n".join(
+        f"[CHUNK {i} | {m['filename']}]\n{d}"
+        for i, (d, m) in enumerate(zip(all_docs, all_metas))
+    )
+    sources = list(dict.fromkeys(m["filename"] for m in all_metas))
+
+    # 4. LLM ответ
+    try:
+        answer = await _chat([
+            {
+                "role": "system",
+                "content": (
+                    "СТРОГО ЗАПРЕЩЕНО придумывать любые числа, лимиты, высоты, расстояния, проценты если их НЕТ дословно в контексте.\n"
+                    "СТРОГО ЗАПРЕЩЕНО добавлять требования из других документов или типичной практики.\n"
+                    "Если точного ответа в контексте нет — ответ ОДНОЙ фразой: Информация в документах не найдена.\n"
+                    "Отвечай ТОЛЬКО перечислением того что прямо написано в контексте. Кратко. Без введения.\n"
+                    "Контекст ниже — это единственный источник правды.\n"
+                    "ПОВТОР: ЗАПРЕЩЕНО использовать информацию не из контекста."
+                )
+            },
+            {
+                "role": "user",
+                "content": f"Контекст:\n\n{context}\n\nВопрос: {req.question}"
+            },
+        ])
+    except Exception as e:
+        raise HTTPException(502, f"Ollama chat error: {e}")
+
+    log.info(f"Raw answer: {answer[:200]!r}")
+
+    # 5. Проверка галлюцинаций с нормализацией
+    answer_clean = answer.strip()
+    for q in ['"', "'", "«", "»"]:
+        answer_clean = answer_clean.strip(q)
+    answer_clean = answer_clean.strip()
+
+    def normalize(t: str) -> str:
+        return re.sub(r'\s+', ' ', t.lower()).strip()
+
+    ctx_norm = normalize(context)
+    ans_norm = normalize(answer_clean)
+
+    if ans_norm and len(ans_norm) > 20:
+        anchor = ans_norm[:60]
+        if anchor not in ctx_norm:
+            # Мягкая проверка — по overlap слов
+            words = ans_norm.split()
+            overlap = sum(1 for w in words if w in ctx_norm)
+            if overlap < max(2, len(words) * 0.4):
+                log.warning(f"Hallucination: low overlap ({overlap}/{len(words)})")
+                answer = "Информация в документах не найдена."
+            else:
+                log.info(f"Soft match: overlap {overlap}/{len(words)}")
+                answer = answer_clean
+        else:
+            answer = answer_clean
+    else:
+        answer = answer_clean
+
+    # Проверка чисел — если в ответе есть числа с единицами которых нет в топ-3 чанках
+    if answer != "Информация в документах не найдена.":
+        import re as _re
+        top3_context = " ".join(all_docs[:3]).lower()
+        nums_in_answer = _re.findall(r"\d+[\s.,]*(?:м|км|мм|%|кг|лет|этаж)", answer.lower())
+        for num in nums_in_answer:
+            if num.strip() not in top3_context:
+                log.warning(f"Hallucination: fabricated number {num!r}")
+                answer = "Информация в документах не найдена."
+                break
+
+    answer = answer.replace("\\n", "\n")
+    download_urls = {s: f"{BASE_URL}/documents/{s}/download" for s in sources}
+    return AskResponse(
+        answer=answer, sources=sources,
+        chunks_used=len(all_docs),
+        download_urls=download_urls,
+        raw_chunks=all_docs[:3]
+    )
