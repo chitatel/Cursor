@@ -355,7 +355,7 @@ def _rrf_fusion(
     return sorted(scores, key=lambda x: scores[x], reverse=True)
 
 
-async def _search_records(query: str, query_embedding: list[float], top_k: int) -> dict:
+async def _search_records(lexical_query: str, query_embedding: list[float], top_k: int) -> dict:
     """Гибридный поиск: FAISS-кандидаты + глобальные lexical-кандидаты + RRF fusion."""
     async with _records_lock:
         records = _load_records_sync()
@@ -380,9 +380,9 @@ async def _search_records(query: str, query_embedding: list[float], top_k: int) 
 
     lexical_fetch_k = min(max(top_k * 8, 12), len(records))
     lexical_texts = [f"{record['filename']} {record['text']}" for record in records]
-    lexical_scores = _bm25_scores(query, lexical_texts)
+    lexical_scores = _bm25_scores(lexical_query, lexical_texts)
     lexical_scores = [
-        score + _filename_match_boost(query, record["filename"])
+        score + _filename_match_boost(lexical_query, record["filename"])
         for score, record in zip(lexical_scores, records)
     ]
     lexical_ids = [
@@ -694,38 +694,46 @@ async def _chat(messages: list[dict], max_tokens: int = 400) -> str:
 
 # ── Query rewrite ─────────────────────────────────────────────────────────────
 
-async def _rewrite_query(q: str) -> str:
+async def _expand_query_for_lexical_search(q: str) -> list[str]:
     """
-    Перефразирует вопрос для улучшения поиска.
-    Включается через QUERY_REWRITE_ENABLED в config.json.
-    По умолчанию выключено — добавляет ~1-2с латентности.
+    Генерирует 3-5 поисковых формулировок того же смысла.
+    Используется только для lexical-поиска; FAISS остается на исходном вопросе.
     """
     if not QUERY_REWRITE_ENABLED:
-        return q
+        return [q]
     try:
-        rewritten = await _chat(
+        expanded = await _chat(
             [
                 {
                     "role": "system",
                     "content": (
-                        "Ты — оптимизатор поисковых запросов.\n"
-                        "Перефразируй вопрос пользователя в краткий поисковый запрос (3–10 слов).\n"
-                        "Убери вводные слова ('скажи мне', 'объясни', 'как'), оставь только ключевые термины.\n"
-                        "Отвечай ТОЛЬКО переформулированным запросом, без пояснений и кавычек.\n"
-                        "Отвечай на том же языке, что и вопрос."
+                        "Ты помогаешь поиску по внутренним инструкциям.\n"
+                        "По вопросу пользователя верни 3-5 коротких поисковых формулировок.\n"
+                        "Требования:\n"
+                        "- только перефразировки того же смысла\n"
+                        "- не добавляй новые сущности, роли, процессы или термины, которых нет в вопросе\n"
+                        "- используй близкие словоформы и канцелярские варианты формулировки\n"
+                        "- каждая строка — отдельный вариант\n"
+                        "- без нумерации, без пояснений, без кавычек\n"
+                        "- язык ответа — тот же, что и у вопроса"
                     ),
                 },
                 {"role": "user", "content": q},
             ],
-            max_tokens=60,
+            max_tokens=120,
         )
-        rewritten = rewritten.strip().strip("\"'«»").strip()
-        if not rewritten or len(rewritten) > len(q) * 2:
-            return q
-        return rewritten
+        variants: list[str] = []
+        for line in expanded.splitlines():
+            candidate = line.strip().strip("\"'«»").strip()
+            candidate = re.sub(r"^\d+[\.\)]\s*", "", candidate).strip()
+            if candidate and candidate not in variants:
+                variants.append(candidate)
+        if q not in variants:
+            variants.insert(0, q)
+        return variants[:5] if variants else [q]
     except Exception as e:
-        log.warning("Query rewrite failed: %s", e)
-        return q
+        log.warning("Query expansion failed: %s", e)
+        return [q]
 
 
 # ── Faithfulness check ────────────────────────────────────────────────────────
@@ -1105,17 +1113,18 @@ async def ask(req: AskRequest):
         raise HTTPException(400, f"top_k must be a positive integer, got: {raw_top_k}")
     top_k = max(1, raw_top_k or TOP_K)
 
-    rewritten = await _rewrite_query(req.question)
-    log.info("Query rewrite: %r → %r", req.question, rewritten)
+    lexical_variants = await _expand_query_for_lexical_search(req.question)
+    lexical_query = " ".join(dict.fromkeys(lexical_variants))
+    log.info("Query expansion: %r → %r", req.question, lexical_variants)
 
     try:
-        q_emb = await _embed(rewritten)
+        q_emb = await _embed(req.question)
         if q_emb is None:
             raise ValueError("embed returned None")
     except Exception as e:
         raise HTTPException(502, f"Embedding API error: {e}")
 
-    results = await _search_records(rewritten, _normalize_embedding(q_emb), top_k)
+    results = await _search_records(lexical_query, _normalize_embedding(q_emb), top_k)
 
     docs = results["documents"][0]
     metas = results["metadatas"][0]
@@ -1128,7 +1137,7 @@ async def ask(req: AskRequest):
             chunks_used=0,
             download_urls={},
             raw_chunks=[],
-            rewritten_query=rewritten,
+            rewritten_query=lexical_query,
         )
 
     best_sim = 1 - distances[0]
@@ -1140,7 +1149,7 @@ async def ask(req: AskRequest):
             chunks_used=0,
             download_urls={},
             raw_chunks=[],
-            rewritten_query=rewritten,
+            rewritten_query=lexical_query,
         )
 
     all_docs, all_metas = _select_document_aware_chunks(
@@ -1208,5 +1217,5 @@ async def ask(req: AskRequest):
         chunks_used=len(all_docs),
         download_urls=download_urls,
         raw_chunks=all_docs[:3],
-        rewritten_query=rewritten,
+        rewritten_query=lexical_query,
     )
