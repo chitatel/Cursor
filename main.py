@@ -317,6 +317,23 @@ def _bm25_scores(query: str, texts: list[str], k1: float = 1.5, b: float = 0.75)
     return scores
 
 
+def _filename_match_boost(query: str, filename: str) -> float:
+    """
+    Небольшой лексический boost по имени файла.
+    Это помогает общим запросам вроде "как согласовать документ" поднимать
+    файлы, в названии которых есть близкие ключи, не ломая основной ranking.
+    """
+    query_tokens = set(re.findall(r"[A-Za-zА-Яа-яЁё0-9]+", query.lower()))
+    if not query_tokens:
+        return 0.0
+    filename_tokens = set(re.findall(r"[A-Za-zА-Яа-яЁё0-9]+", Path(filename).stem.lower()))
+    if not filename_tokens:
+        return 0.0
+    overlap = len(query_tokens & filename_tokens)
+    # Boost небольшой и дискретный: он только помогает shortlist, а не заменяет FAISS.
+    return min(overlap * 0.35, 1.4)
+
+
 def _rrf_fusion(
     vector_ids: list[str],
     bm25_ids: list[str],
@@ -339,36 +356,42 @@ def _rrf_fusion(
 
 
 async def _search_records(query: str, query_embedding: list[float], top_k: int) -> dict:
-    """Гибридный поиск: FAISS вектор + BM25 + RRF fusion."""
+    """Гибридный поиск: FAISS-кандидаты + глобальные lexical-кандидаты + RRF fusion."""
     async with _records_lock:
         records = _load_records_sync()
         index = _get_faiss_index_sync(records)
 
-    if index is None or not records:
+    if not records:
         return {"ids": [[]], "documents": [[]], "metadatas": [[]], "distances": [[]]}
-
-    vec = np.asarray([query_embedding], dtype="float32")
-    fetch_k = min(top_k * 3, len(records))
-    scores, indices = index.search(vec, fetch_k)
 
     id_to_record = {r["id"]: r for r in records}
     vector_ids: list[str] = []
     vector_distances: dict[str, float] = {}
-    for score, idx in zip(scores[0], indices[0]):
-        if idx < 0:
-            continue
-        record = records[int(idx)]
-        vector_ids.append(record["id"])
-        vector_distances[record["id"]] = float(1 - score)
+    if index is not None:
+        vec = np.asarray([query_embedding], dtype="float32")
+        vector_fetch_k = min(max(top_k * 8, 12), len(records))
+        scores, indices = index.search(vec, vector_fetch_k)
+        for score, idx in zip(scores[0], indices[0]):
+            if idx < 0:
+                continue
+            record = records[int(idx)]
+            vector_ids.append(record["id"])
+            vector_distances[record["id"]] = float(1 - score)
 
-    candidate_records = [id_to_record[i] for i in vector_ids if i in id_to_record]
-    bm25_raw = _bm25_scores(query, [r["text"] for r in candidate_records])
-    bm25_ranked = [
-        candidate_records[i]["id"]
-        for i in sorted(range(len(bm25_raw)), key=lambda x: bm25_raw[x], reverse=True)
+    lexical_fetch_k = min(max(top_k * 8, 12), len(records))
+    lexical_texts = [f"{record['filename']} {record['text']}" for record in records]
+    lexical_scores = _bm25_scores(query, lexical_texts)
+    lexical_scores = [
+        score + _filename_match_boost(query, record["filename"])
+        for score, record in zip(lexical_scores, records)
+    ]
+    lexical_ids = [
+        records[i]["id"]
+        for i in sorted(range(len(lexical_scores)), key=lambda x: lexical_scores[x], reverse=True)[:lexical_fetch_k]
+        if lexical_scores[i] > 0
     ]
 
-    fused_ids = _rrf_fusion(vector_ids, bm25_ranked, bm25_weight=BM25_WEIGHT)[:top_k]
+    fused_ids = _rrf_fusion(vector_ids, lexical_ids, bm25_weight=BM25_WEIGHT)[:top_k]
 
     ids: list[str] = []
     docs: list[str] = []
