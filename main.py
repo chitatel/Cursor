@@ -409,6 +409,58 @@ async def _search_records(query: str, query_embedding: list[float], top_k: int) 
     return {"ids": [ids], "documents": [docs], "metadatas": [metas], "distances": [distances]}
 
 
+def _select_document_aware_chunks(
+    docs: list[str],
+    metas: list[dict],
+    distances: list[float],
+    max_docs: int = 5,
+    per_doc_chunks: int = 2,
+    relative_threshold: float = 0.75,
+) -> tuple[list[str], list[dict]]:
+    """
+    Группирует чанки по документам и отбирает 1..max_docs документов,
+    чьи score близки к лидеру. Затем берет ограниченное число лучших чанков
+    из каждого документа.
+    """
+    if not docs:
+        return [], []
+
+    buckets: dict[str, list[tuple[float, str, dict]]] = {}
+    for doc, meta, distance in zip(docs, metas, distances):
+        filename = meta["filename"]
+        score = 1.0 - distance
+        buckets.setdefault(filename, []).append((score, doc, meta))
+
+    ranked_docs: list[tuple[str, float, int]] = []
+    for filename, items in buckets.items():
+        items.sort(key=lambda x: x[0], reverse=True)
+        best_score = items[0][0]
+        chunk_count = len(items)
+        doc_score = best_score + 0.12 * min(chunk_count, 4)
+        ranked_docs.append((filename, doc_score, chunk_count))
+
+    ranked_docs.sort(key=lambda x: x[1], reverse=True)
+    if not ranked_docs:
+        return [], []
+
+    leader_score = ranked_docs[0][1]
+    selected_filenames = [
+        filename
+        for filename, doc_score, _chunk_count in ranked_docs[:max_docs]
+        if doc_score >= leader_score * relative_threshold
+    ]
+
+    selected_docs: list[str] = []
+    selected_metas: list[dict] = []
+    for filename in selected_filenames:
+        items = buckets[filename]
+        for _score, doc, meta in items[:per_doc_chunks]:
+            selected_docs.append(doc)
+            selected_metas.append(meta)
+
+    return selected_docs, selected_metas
+
+
 # ── Auth / HTTP ───────────────────────────────────────────────────────────────
 
 async def _get_auth_token(force_refresh: bool = False) -> str:
@@ -1091,19 +1143,18 @@ async def ask(req: AskRequest):
             rewritten_query=rewritten,
         )
 
-    doc_counts: dict[str, int] = {}
-    for meta in metas:
-        fn = meta["filename"]
-        doc_counts[fn] = doc_counts.get(fn, 0) + 1
+    all_docs, all_metas = _select_document_aware_chunks(
+        docs,
+        metas,
+        distances,
+        max_docs=5,
+        per_doc_chunks=2,
+        relative_threshold=0.75,
+    )
 
-    primary_filename = metas[0]["filename"]
-    all_docs: list[str] = []
-    all_metas: list[dict] = []
-    for doc, meta in zip(docs, metas):
-        fn = meta["filename"]
-        if fn == primary_filename or doc_counts.get(fn, 0) >= 2:
-            all_docs.append(doc)
-            all_metas.append(meta)
+    if not all_docs:
+        all_docs = docs
+        all_metas = metas
 
     context = "\n\n".join(
         f"[CHUNK {i} | {m['filename']}]\n{d}"
