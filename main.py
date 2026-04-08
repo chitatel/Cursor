@@ -403,24 +403,24 @@ async def _search_records(lexical_query: str, query_embedding: list[float], top_
         record = id_to_record[doc_id]
         ids.append(record["id"])
         docs.append(record["text"])
-        metas.append({"filename": record["filename"]})
+        metas.append({"filename": record["filename"], "chunk_idx": record.get("chunk_idx", -1)})
         distances.append(vector_distances.get(doc_id, 1.0))
 
     return {"ids": [ids], "documents": [docs], "metadatas": [metas], "distances": [distances]}
 
 
-def _select_document_aware_chunks(
+async def _build_document_aware_context(
     docs: list[str],
     metas: list[dict],
     distances: list[float],
+    retrieval_top_k: int,
     max_docs: int = 5,
-    per_doc_chunks: int = 2,
     relative_threshold: float = 0.75,
 ) -> tuple[list[str], list[dict]]:
     """
-    Группирует чанки по документам и отбирает 1..max_docs документов,
-    чьи score близки к лидеру. Затем берет ограниченное число лучших чанков
-    из каждого документа.
+    Собирает контекст по схеме:
+    - главный документ получает расширенный бюджет и соседние чанки
+    - второстепенные документы дают точечные подтверждения
     """
     if not docs:
         return [], []
@@ -450,11 +450,53 @@ def _select_document_aware_chunks(
         if doc_score >= leader_score * relative_threshold
     ]
 
+    main_filename = selected_filenames[0]
+    secondary_filenames = selected_filenames[1:]
+    main_doc_budget = min(max(retrieval_top_k, 3), 6)
+    secondary_doc_budget = 1
+
     selected_docs: list[str] = []
     selected_metas: list[dict] = []
-    for filename in selected_filenames:
+
+    main_doc_records = sorted(
+        await _document_records(main_filename),
+        key=lambda x: x.get("chunk_idx", 0),
+    )
+    main_by_idx = {record.get("chunk_idx", idx): record for idx, record in enumerate(main_doc_records)}
+    main_items = buckets[main_filename]
+    main_items.sort(key=lambda x: x[0], reverse=True)
+
+    chosen_indices: list[int] = []
+    seen_indices: set[int] = set()
+
+    for _score, _doc, meta in main_items[:2]:
+        chunk_idx = meta.get("chunk_idx", -1)
+        for neighbor_idx in (chunk_idx - 1, chunk_idx, chunk_idx + 1):
+            if neighbor_idx in main_by_idx and neighbor_idx not in seen_indices:
+                seen_indices.add(neighbor_idx)
+                chosen_indices.append(neighbor_idx)
+            if len(chosen_indices) >= main_doc_budget:
+                break
+        if len(chosen_indices) >= main_doc_budget:
+            break
+
+    for _score, _doc, meta in main_items:
+        chunk_idx = meta.get("chunk_idx", -1)
+        if chunk_idx in main_by_idx and chunk_idx not in seen_indices:
+            seen_indices.add(chunk_idx)
+            chosen_indices.append(chunk_idx)
+        if len(chosen_indices) >= main_doc_budget:
+            break
+
+    for chunk_idx in sorted(chosen_indices):
+        record = main_by_idx[chunk_idx]
+        selected_docs.append(record["text"])
+        selected_metas.append({"filename": record["filename"], "chunk_idx": record.get("chunk_idx", chunk_idx)})
+
+    for filename in secondary_filenames:
         items = buckets[filename]
-        for _score, doc, meta in items[:per_doc_chunks]:
+        items.sort(key=lambda x: x[0], reverse=True)
+        for _score, doc, meta in items[:secondary_doc_budget]:
             selected_docs.append(doc)
             selected_metas.append(meta)
 
@@ -896,6 +938,7 @@ async def _run_indexing(filename: str, dest: Path):
                         {
                             "id": f"{filename}_{batch_start + offset}",
                             "filename": filename,
+                            "chunk_idx": batch_start + offset,
                             "text": text,
                             "embedding": _normalize_embedding(emb),
                         }
@@ -1152,12 +1195,12 @@ async def ask(req: AskRequest):
             rewritten_query=lexical_query,
         )
 
-    all_docs, all_metas = _select_document_aware_chunks(
+    all_docs, all_metas = await _build_document_aware_context(
         docs,
         metas,
         distances,
+        retrieval_top_k=top_k,
         max_docs=5,
-        per_doc_chunks=2,
         relative_threshold=0.75,
     )
 
