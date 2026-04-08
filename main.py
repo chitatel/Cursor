@@ -742,6 +742,38 @@ def _load_documents(path: Path):
     return SimpleDirectoryReader(input_files=[str(path)]).load_data()
 
 
+def _detect_chunk_profile(texts: list[str]) -> tuple[str, int, int]:
+    """
+    Простейшая эвристика для mixed corpus:
+    - cheatsheet: много коротких строк, списков и коротких заголовков
+    - manual: более длинные связные абзацы
+    """
+    merged = "\n".join(t for t in texts if t).strip()
+    if not merged:
+        return ("manual", CHUNK_SIZE, CHUNK_OVERLAP)
+
+    lines = [line.strip() for line in merged.splitlines() if line.strip()]
+    if not lines:
+        return ("manual", CHUNK_SIZE, CHUNK_OVERLAP)
+
+    short_lines = sum(1 for line in lines if len(line) <= 80)
+    numbered_lines = sum(1 for line in lines if re.match(r"^\d+[\.\)]\s+", line))
+    heading_like = sum(
+        1
+        for line in lines
+        if len(line) <= 120 and not line.endswith(".") and len(line.split()) <= 12
+    )
+
+    total_lines = len(lines)
+    short_ratio = short_lines / total_lines
+    numbered_ratio = numbered_lines / total_lines
+    heading_ratio = heading_like / total_lines
+
+    if short_ratio > 0.45 or numbered_ratio > 0.15 or heading_ratio > 0.20:
+        return ("cheatsheet", 350, 50)
+    return ("manual", 800, 120)
+
+
 # ── Индексирование ────────────────────────────────────────────────────────────
 
 async def _run_indexing(filename: str, dest: Path):
@@ -765,7 +797,20 @@ async def _run_indexing(filename: str, dest: Path):
             if not docs:
                 raise ValueError("No text extracted from file")
 
-            splitter = SentenceSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
+            doc_texts = [getattr(doc, "text", "").strip() for doc in docs if getattr(doc, "text", "").strip()]
+            profile, effective_chunk_size, effective_chunk_overlap = _detect_chunk_profile(doc_texts)
+            log.info(
+                "[%s] chunk profile: %s (%d/%d)",
+                filename,
+                profile,
+                effective_chunk_size,
+                effective_chunk_overlap,
+            )
+
+            splitter = SentenceSplitter(
+                chunk_size=effective_chunk_size,
+                chunk_overlap=effective_chunk_overlap,
+            )
             nodes = await loop.run_in_executor(
                 None,
                 lambda: splitter.get_nodes_from_documents(docs),
