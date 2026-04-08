@@ -1,23 +1,36 @@
 """
-RAG сервис v3.5 — production pipeline
-- Query rewrite (1 LLM вызов перед поиском)
-- Hybrid search (vector + keyword)
-- ChromaDB + LlamaIndex SentenceSplitter
-- Защита от галлюцинаций
+RAG сервис v4.4 — production pipeline
+- FAISS (IndexFlatIP) + LlamaIndex SentenceSplitter
+- Vector search + BM25 внутри RRF fusion по vector shortlist
+  (не полноценный hybrid retrieval по всему корпусу — BM25 работает только
+   поверх vector shortlist; это осознанный компромисс без доп. зависимостей)
+- Query rewrite через LLM (опционально, QUERY_REWRITE_ENABLED=false по умолчанию)
+- Overlap-эвристика защиты от галлюцинаций (без доп. LLM-вызова)
+- Батчевые эмбеддинги (×N быстрее индексирования)
+- Thread-safe in-memory кэш записей; index.json с recovery при повреждении
+- _faiss_index сбрасывается в None ДО записи JSON и rebuild — при сбое
+  rebuild поиск вернёт пустой результат, а не данные от старого индекса
+- index.json пишется раньше index.faiss; FAISS всегда перестраивается из JSON
+  на старте — защита от рассинхронизации в том числе при совпадении ntotal
+- Бэкапы битого JSON именуются с timestamp (index.json.bak.<ts>), не перезаписываются
+- Path traversal защита на всех файловых эндпоинтах (Python 3.8+ совместимо)
+- Потоковая загрузка файлов (без буферизации в памяти)
 """
 
 import os
 import re
 import json
+import math
 import logging
 import asyncio
 from pathlib import Path
 from typing import Optional
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 
 import httpx
 import numpy as np
+import aiofiles
 from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
@@ -44,25 +57,33 @@ def _config_value(name: str):
     return CONFIG[name]
 
 
-OLLAMA_BASE_URL    = _config_value("OLLAMA_BASE_URL")
-OLLAMA_LLM_MODEL   = _config_value("OLLAMA_LLM_MODEL")
+OLLAMA_BASE_URL = _config_value("OLLAMA_BASE_URL")
+OLLAMA_LLM_MODEL = _config_value("OLLAMA_LLM_MODEL")
 OLLAMA_EMBED_MODEL = _config_value("OLLAMA_EMBED_MODEL")
-LLM_API_MODE       = str(_config_value("LLM_API_MODE")).strip().lower()
-STORAGE_DIR        = Path(_config_value("STORAGE_DIR"))
+LLM_API_MODE = str(_config_value("LLM_API_MODE")).strip().lower()
+STORAGE_DIR = Path(_config_value("STORAGE_DIR"))
 if not STORAGE_DIR.is_absolute():
     STORAGE_DIR = (APP_DIR / STORAGE_DIR).resolve()
-FILES_DIR          = STORAGE_DIR / "files"
-INDEX_FILE         = STORAGE_DIR / "index.json"
-FAISS_INDEX_FILE   = STORAGE_DIR / "index.faiss"
-TOP_K              = int(_config_value("TOP_K"))
-CHUNK_SIZE         = int(_config_value("CHUNK_SIZE"))
-CHUNK_OVERLAP      = int(_config_value("CHUNK_OVERLAP"))
-BASE_URL           = _config_value("BASE_URL")
-SIM_THRESHOLD      = float(_config_value("SIM_THRESHOLD"))
-OLLAMA_API_KEY     = _config_value("OLLAMA_API_KEY")
+FILES_DIR = STORAGE_DIR / "files"
+INDEX_FILE = STORAGE_DIR / "index.json"
+FAISS_INDEX_FILE = STORAGE_DIR / "index.faiss"
+TOP_K = int(_config_value("TOP_K"))
+CHUNK_SIZE = int(_config_value("CHUNK_SIZE"))
+CHUNK_OVERLAP = int(_config_value("CHUNK_OVERLAP"))
+BASE_URL = _config_value("BASE_URL")
+SIM_THRESHOLD = float(_config_value("SIM_THRESHOLD"))
+OLLAMA_API_KEY = _config_value("OLLAMA_API_KEY")
 OPENWEBUI_AUTH_PATH = _config_value("OPENWEBUI_AUTH_PATH")
-OPENWEBUI_USER     = _config_value("OPENWEBUI_USER")
+OPENWEBUI_USER = _config_value("OPENWEBUI_USER")
 OPENWEBUI_PASSWORD = _config_value("OPENWEBUI_PASSWORD")
+
+# Размер батча для эмбеддингов при индексировании
+EMBED_BATCH_SIZE = int(CONFIG.get("EMBED_BATCH_SIZE", 32))
+# Включить query rewrite (добавляет 1 LLM-вызов, может улучшить recall)
+QUERY_REWRITE_ENABLED = bool(CONFIG.get("QUERY_REWRITE_ENABLED", False))
+# Вес BM25 при RRF fusion (0.0 — только вектор, 1.0 — только BM25)
+# BM25 работает поверх vector shortlist, не по всему корпусу
+BM25_WEIGHT = float(CONFIG.get("BM25_WEIGHT", 0.5))
 
 os.environ["ANONYMIZED_TELEMETRY"] = "FALSE"
 
@@ -74,26 +95,57 @@ FILES_DIR.mkdir(exist_ok=True)
 
 SUPPORTED = {".pdf", ".docx", ".txt", ".md", ".msg"}
 
+# ── Глобальное состояние ─────────────────────────────────────────────────────
+
 _records: Optional[list[dict]] = None
+_records_lock = asyncio.Lock()
 _faiss_index = None
 _indexing: dict[str, dict] = {}
 _indexing_locks: dict[str, asyncio.Lock] = {}
 _auth_token: Optional[str] = None
 _auth_lock = asyncio.Lock()
-_store_lock = asyncio.Lock()
 
 
-def _load_records() -> list[dict]:
+# ── Хранилище записей ────────────────────────────────────────────────────────
+
+def _load_records_sync() -> list[dict]:
+    """
+    Синхронное чтение с диска (вызывать только под _records_lock).
+    При повреждённом JSON переименовывает файл в index.json.bak.<timestamp>
+    и стартует с пустым индексом, чтобы сервис поднялся, а не упал.
+    Timestamp в имени гарантирует, что предыдущие бэкапы не перезаписываются.
+    """
     global _records
     if _records is None:
         if INDEX_FILE.exists():
-            _records = json.loads(INDEX_FILE.read_text(encoding="utf-8"))
+            try:
+                _records = json.loads(INDEX_FILE.read_text(encoding="utf-8"))
+            except Exception as e:
+                ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                bak = INDEX_FILE.with_name(f"index.json.bak.{ts}")
+                log.error(
+                    "index.json is corrupted (%s). Renaming to %s and starting with empty index.",
+                    e,
+                    bak,
+                )
+                try:
+                    INDEX_FILE.rename(bak)
+                except Exception as rename_err:
+                    log.error("Could not rename corrupted index.json: %s", rename_err)
+                _records = []
         else:
             _records = []
     return _records
 
 
-def _save_records(records: list[dict]):
+async def _get_records() -> list[dict]:
+    """Потокобезопасное получение записей."""
+    async with _records_lock:
+        return list(_load_records_sync())
+
+
+def _save_records_sync(records: list[dict]):
+    """Атомарная запись на диск (вызывать только под _records_lock)."""
     global _records
     tmp = INDEX_FILE.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(records, ensure_ascii=False), encoding="utf-8")
@@ -109,15 +161,17 @@ def _normalize_embedding(embedding: list[float]) -> list[float]:
     return vec.tolist()
 
 
+# ── FAISS ────────────────────────────────────────────────────────────────────
+
 def _load_faiss():
     import faiss
 
     return faiss
 
 
-def _rebuild_faiss_index(records: list[dict]):
+def _rebuild_faiss_index_sync(records: list[dict]):
+    """Перестроить FAISS индекс (вызывать только под _records_lock)."""
     global _faiss_index
-
     if not records:
         _faiss_index = None
         if FAISS_INDEX_FILE.exists():
@@ -135,9 +189,9 @@ def _rebuild_faiss_index(records: list[dict]):
     _faiss_index = index
 
 
-def _get_faiss_index():
+def _get_faiss_index_sync(records: list[dict]):
+    """Получить FAISS индекс (вызывать только под _records_lock)."""
     global _faiss_index
-    records = _load_records()
     if not records:
         _faiss_index = None
         return None
@@ -147,121 +201,192 @@ def _get_faiss_index():
             index = faiss.read_index(str(FAISS_INDEX_FILE))
             if index.ntotal != len(records):
                 log.warning(
-                    "FAISS index mismatch: ntotal=%s, records=%s. Rebuilding index.",
+                    "FAISS index mismatch: ntotal=%s, records=%s. Rebuilding.",
                     index.ntotal,
                     len(records),
                 )
-                _rebuild_faiss_index(records)
+                _rebuild_faiss_index_sync(records)
             else:
-                _faiss_index = index
+                first = np.asarray(records[0]["embedding"], dtype="float32")
+                norm = float(np.linalg.norm(first))
+                if abs(norm - 1.0) > 0.01:
+                    log.warning("Embeddings not normalized (norm=%.3f). Rebuilding.", norm)
+                    for r in records:
+                        r["embedding"] = _normalize_embedding(r["embedding"])
+                    _save_records_sync(records)
+                    _rebuild_faiss_index_sync(records)
+                else:
+                    _faiss_index = index
         else:
-            _rebuild_faiss_index(records)
+            _rebuild_faiss_index_sync(records)
     return _faiss_index
 
 
-def _chunk_count() -> int:
-    return len(_load_records())
+# ── Операции над записями (потокобезопасные) ─────────────────────────────────
+
+async def _chunk_count() -> int:
+    return len(await _get_records())
 
 
-def _document_chunk_counts() -> dict[str, int]:
+async def _document_chunk_counts() -> dict[str, int]:
     counts: dict[str, int] = {}
-    for record in _load_records():
+    for record in await _get_records():
         fn = record["filename"]
         counts[fn] = counts.get(fn, 0) + 1
     return counts
 
 
-def _document_records(filename: str) -> list[dict]:
-    return [r for r in _load_records() if r["filename"] == filename]
+async def _document_records(filename: str) -> list[dict]:
+    return [r for r in await _get_records() if r["filename"] == filename]
 
 
 async def _replace_document_records(filename: str, new_records: list[dict]) -> int:
-    async with _store_lock:
-        current = _load_records()
+    global _faiss_index
+    async with _records_lock:
+        current = _load_records_sync()
         records = [r for r in current if r["filename"] != filename]
         removed = len(current) - len(records)
         records.extend(new_records)
-        _rebuild_faiss_index(records)
-        _save_records(records)
+        _faiss_index = None
+        _save_records_sync(records)
+        _rebuild_faiss_index_sync(records)
         return removed
 
 
 async def _delete_document_records(filename: str) -> int:
-    async with _store_lock:
-        current = _load_records()
+    global _faiss_index
+    async with _records_lock:
+        current = _load_records_sync()
         records = [r for r in current if r["filename"] != filename]
         removed = len(current) - len(records)
         if removed == 0:
             return 0
-        _rebuild_faiss_index(records)
-        _save_records(records)
+        _faiss_index = None
+        _save_records_sync(records)
+        _rebuild_faiss_index_sync(records)
         return removed
 
 
-def _search_records(query_embedding: list[float], top_k: int) -> dict:
-    index = _get_faiss_index()
-    records = _load_records()
+# ── Безопасность файловых путей ───────────────────────────────────────────────
+
+def _safe_filename(filename: str) -> str:
+    """
+    Проверяет, что имя файла не выходит за пределы FILES_DIR.
+    Возбуждает HTTPException(400) при path traversal попытке.
+    Возвращает нормализованное имя файла (только basename).
+    Совместимо с Python 3.8+ (не использует Path.is_relative_to).
+    """
+    name = Path(filename).name
+    if not name or name != filename:
+        raise HTTPException(400, f"Invalid filename: '{filename}'")
+    resolved = str((FILES_DIR / name).resolve())
+    files_dir = str(FILES_DIR.resolve())
+    if not resolved.startswith(files_dir + os.sep) and resolved != files_dir:
+        raise HTTPException(400, f"Invalid filename: '{filename}'")
+    return name
+
+
+def _bm25_scores(query: str, texts: list[str], k1: float = 1.5, b: float = 0.75) -> list[float]:
+    """Минималистичный BM25 без внешних зависимостей."""
+    tokenize = lambda t: re.findall(r"[A-Za-zА-Яа-яЁё0-9]+", t.lower())
+    q_tokens = set(tokenize(query))
+    if not q_tokens:
+        return [0.0] * len(texts)
+
+    tokenized = [tokenize(t) for t in texts]
+    doc_lens = [len(t) for t in tokenized]
+    avg_dl = sum(doc_lens) / max(len(doc_lens), 1)
+    n_docs = len(texts)
+
+    scores = []
+    for tokens in tokenized:
+        tf_map: dict[str, int] = {}
+        for tok in tokens:
+            tf_map[tok] = tf_map.get(tok, 0) + 1
+        score = 0.0
+        dl = len(tokens)
+        for term in q_tokens:
+            df = sum(1 for toks in tokenized if term in toks)
+            if df == 0:
+                continue
+            idf = math.log((n_docs - df + 0.5) / (df + 0.5) + 1)
+            tf = tf_map.get(term, 0)
+            tf_norm = tf * (k1 + 1) / (tf + k1 * (1 - b + b * dl / avg_dl))
+            score += idf * tf_norm
+        scores.append(score)
+    return scores
+
+
+def _rrf_fusion(
+    vector_ids: list[str],
+    bm25_ids: list[str],
+    bm25_weight: float = 0.5,
+    rrf_k: int = 60,
+) -> list[str]:
+    """
+    Reciprocal Rank Fusion двух ранжированных списков.
+    Возвращает список id, отсортированных по убыванию RRF-score.
+    """
+    scores: dict[str, float] = {}
+    vector_weight = 1.0 - bm25_weight
+
+    for rank, doc_id in enumerate(vector_ids):
+        scores[doc_id] = scores.get(doc_id, 0.0) + vector_weight / (rrf_k + rank + 1)
+    for rank, doc_id in enumerate(bm25_ids):
+        scores[doc_id] = scores.get(doc_id, 0.0) + bm25_weight / (rrf_k + rank + 1)
+
+    return sorted(scores, key=lambda x: scores[x], reverse=True)
+
+
+async def _search_records(query: str, query_embedding: list[float], top_k: int) -> dict:
+    """Гибридный поиск: FAISS вектор + BM25 + RRF fusion."""
+    async with _records_lock:
+        records = _load_records_sync()
+        index = _get_faiss_index_sync(records)
+
     if index is None or not records:
         return {"ids": [[]], "documents": [[]], "metadatas": [[]], "distances": [[]]}
 
     vec = np.asarray([query_embedding], dtype="float32")
-    scores, indices = index.search(vec, min(top_k, len(records)))
+    fetch_k = min(top_k * 3, len(records))
+    scores, indices = index.search(vec, fetch_k)
+
+    id_to_record = {r["id"]: r for r in records}
+    vector_ids: list[str] = []
+    vector_distances: dict[str, float] = {}
+    for score, idx in zip(scores[0], indices[0]):
+        if idx < 0:
+            continue
+        record = records[int(idx)]
+        vector_ids.append(record["id"])
+        vector_distances[record["id"]] = float(1 - score)
+
+    candidate_records = [id_to_record[i] for i in vector_ids if i in id_to_record]
+    bm25_raw = _bm25_scores(query, [r["text"] for r in candidate_records])
+    bm25_ranked = [
+        candidate_records[i]["id"]
+        for i in sorted(range(len(bm25_raw)), key=lambda x: bm25_raw[x], reverse=True)
+    ]
+
+    fused_ids = _rrf_fusion(vector_ids, bm25_ranked, bm25_weight=BM25_WEIGHT)[:top_k]
 
     ids: list[str] = []
     docs: list[str] = []
     metas: list[dict] = []
     distances: list[float] = []
-    for score, idx in zip(scores[0], indices[0]):
-        if idx < 0:
+    for doc_id in fused_ids:
+        if doc_id not in id_to_record:
             continue
-        record = records[int(idx)]
+        record = id_to_record[doc_id]
         ids.append(record["id"])
         docs.append(record["text"])
         metas.append({"filename": record["filename"]})
-        distances.append(float(1 - score))
+        distances.append(vector_distances.get(doc_id, 1.0))
 
     return {"ids": [ids], "documents": [docs], "metadatas": [metas], "distances": [distances]}
 
 
-def _load_documents(path: Path):
-    suffix = path.suffix.lower()
-    if suffix == ".msg":
-        try:
-            import extract_msg
-            from llama_index.core.schema import Document
-        except ImportError as e:
-            raise RuntimeError(
-                "MSG support requires the 'extract-msg' package"
-            ) from e
-
-        message = extract_msg.Message(str(path))
-        parts = []
-
-        subject = (message.subject or "").strip()
-        sender = (message.sender or "").strip()
-        date = (message.date or "").strip()
-        body = (message.body or "").strip()
-
-        if subject:
-            parts.append(f"Subject: {subject}")
-        if sender:
-            parts.append(f"From: {sender}")
-        if date:
-            parts.append(f"Date: {date}")
-        if body:
-            parts.append("")
-            parts.append(body)
-
-        text = "\n".join(parts).strip()
-        if not text:
-            raise ValueError("No text extracted from MSG file")
-
-        return [Document(text=text, metadata={"filename": path.name})]
-
-    from llama_index.core import SimpleDirectoryReader
-
-    return SimpleDirectoryReader(input_files=[str(path)]).load_data()
-
+# ── Auth / HTTP ───────────────────────────────────────────────────────────────
 
 async def _get_auth_token(force_refresh: bool = False) -> str:
     global _auth_token
@@ -283,21 +408,21 @@ async def _get_auth_token(force_refresh: bool = False) -> str:
         payload = {"user": OPENWEBUI_USER, "password": OPENWEBUI_PASSWORD}
 
         async with httpx.AsyncClient(timeout=60) as c:
-            r = await c.post(
+            response = await c.post(
                 signin_url,
                 json=payload,
                 headers={"Content-Type": "application/json"},
             )
-            r.raise_for_status()
-            data = r.json()
+            response.raise_for_status()
+            data = response.json()
 
         token = (
             data.get("token")
             or data.get("access_token")
             or data.get("data", {}).get("token")
         )
-        if not token and "token=" in r.headers.get("set-cookie", ""):
-            cookie = r.headers["set-cookie"].split("token=", 1)[1]
+        if not token and "token=" in response.headers.get("set-cookie", ""):
+            cookie = response.headers["set-cookie"].split("token=", 1)[1]
             token = cookie.split(";", 1)[0]
         if not token:
             raise ValueError("Open WebUI signin succeeded but token was not returned")
@@ -321,7 +446,6 @@ def _base_url() -> str:
 def _api_mode() -> str:
     if LLM_API_MODE in {"ollama", "openai", "openwebui"}:
         return LLM_API_MODE
-
     base = _base_url().lower()
     if "/api/chat/completions" in base or "/ollama/api" in base:
         return "openwebui"
@@ -365,188 +489,347 @@ def _embed_url() -> str:
     return f"{_base_url()}/api/embed"
 
 
-async def _embed(text: str):
-    async with httpx.AsyncClient(timeout=120) as c:
-        headers = await _api_headers()
-        r = await c.post(
+# ── Embed (с батчингом) ───────────────────────────────────────────────────────
+
+async def _embed_one(text: str, client: httpx.AsyncClient) -> Optional[list[float]]:
+    headers = await _api_headers()
+    response = await client.post(
+        _embed_url(),
+        headers=headers,
+        json={"model": OLLAMA_EMBED_MODEL, "input": text},
+    )
+    if response.status_code == 401 and OPENWEBUI_PASSWORD and OPENWEBUI_USER:
+        headers = await _api_headers(force_refresh=True)
+        response = await client.post(
             _embed_url(),
             headers=headers,
             json={"model": OLLAMA_EMBED_MODEL, "input": text},
         )
-        if r.status_code == 401 and OPENWEBUI_PASSWORD and OPENWEBUI_USER:
-            headers = await _api_headers(force_refresh=True)
-            r = await c.post(
+    if response.status_code == 400:
+        return None
+    response.raise_for_status()
+    data = response.json()
+    if "data" in data:
+        return data["data"][0]["embedding"]
+    embeddings = data["embeddings"]
+    return embeddings[0] if isinstance(embeddings[0], list) else embeddings
+
+
+async def _embed(text: str) -> Optional[list[float]]:
+    """Получить эмбеддинг для одного текста."""
+    async with httpx.AsyncClient(timeout=120) as c:
+        return await _embed_one(text, c)
+
+
+async def _embed_batch(texts: list[str]) -> list[Optional[list[float]]]:
+    """
+    Батчевые эмбеддинги: один HTTP-запрос на батч (если модель поддерживает),
+    с fallback на поштучный запрос при ошибке.
+    """
+    if not texts:
+        return []
+
+    async with httpx.AsyncClient(timeout=300) as c:
+        headers = await _api_headers()
+        try:
+            response = await c.post(
                 _embed_url(),
                 headers=headers,
-                json={"model": OLLAMA_EMBED_MODEL, "input": text},
+                json={"model": OLLAMA_EMBED_MODEL, "input": texts},
             )
-        if r.status_code == 400:
-            return None
-        r.raise_for_status()
-        data = r.json()
-        if "data" in data:
-            return data["data"][0]["embedding"]
-        emb = data["embeddings"]
-        return emb[0] if isinstance(emb[0], list) else emb
+            if response.status_code == 401 and OPENWEBUI_PASSWORD and OPENWEBUI_USER:
+                headers = await _api_headers(force_refresh=True)
+                response = await c.post(
+                    _embed_url(),
+                    headers=headers,
+                    json={"model": OLLAMA_EMBED_MODEL, "input": texts},
+                )
+
+            if response.status_code == 400:
+                raise ValueError("batch not supported")
+
+            response.raise_for_status()
+            data = response.json()
+
+            if "data" in data:
+                sorted_items = sorted(data["data"], key=lambda x: x.get("index", 0))
+                return [item["embedding"] for item in sorted_items]
+
+            embeddings = data.get("embeddings", [])
+            if embeddings and isinstance(embeddings[0], list):
+                return embeddings
+            raise ValueError("unexpected batch response shape")
+
+        except Exception as e:
+            log.warning("Batch embed failed (%s), falling back to sequential", e)
+            results = []
+            for text in texts:
+                results.append(await _embed_one(text, c))
+            return results
 
 
-async def _chat(messages: list[dict]) -> str:
+# ── LLM chat ─────────────────────────────────────────────────────────────────
+
+async def _chat(messages: list[dict], max_tokens: int = 400) -> str:
     async with httpx.AsyncClient(timeout=600) as c:
         headers = await _api_headers()
         mode = _api_mode()
+
+        payload_openai = {
+            "model": OLLAMA_LLM_MODEL,
+            "messages": messages,
+            "stream": False,
+            "temperature": 0.0,
+            "top_p": 0.85,
+            "max_tokens": max_tokens,
+        }
+        payload_ollama = {
+            "model": OLLAMA_LLM_MODEL,
+            "messages": messages,
+            "stream": False,
+            "think": False,
+            "options": {
+                "temperature": 0.0,
+                "top_p": 0.85,
+                "top_k": 30,
+                "repeat_penalty": 1.15,
+                "num_ctx": 8192,
+            },
+        }
+
+        async def _post(payload):
+            response = await c.post(_chat_url(), headers=headers, json=payload)
+            if response.status_code == 401 and OPENWEBUI_PASSWORD and OPENWEBUI_USER:
+                refreshed_headers = await _api_headers(force_refresh=True)
+                response = await c.post(_chat_url(), headers=refreshed_headers, json=payload)
+            response.raise_for_status()
+            return response
+
         if mode in {"openai", "openwebui"}:
-            r = await c.post(
-                _chat_url(),
-                headers=headers,
-                json={
-                    "model": OLLAMA_LLM_MODEL,
-                    "messages": messages,
-                    "stream": False,
-                    "temperature": 0.0,
-                    "top_p": 0.85,
-                    "max_tokens": 400,
-                },
-            )
-            if r.status_code == 401 and OPENWEBUI_PASSWORD and OPENWEBUI_USER:
-                headers = await _api_headers(force_refresh=True)
-                r = await c.post(
-                    _chat_url(),
-                    headers=headers,
-                    json={
-                        "model": OLLAMA_LLM_MODEL,
-                        "messages": messages,
-                        "stream": False,
-                        "temperature": 0.0,
-                        "top_p": 0.85,
-                        "max_tokens": 400,
-                    },
-                )
-            r.raise_for_status()
-            content = r.json()["choices"][0]["message"]["content"]
+            response = await _post(payload_openai)
+            content = response.json()["choices"][0]["message"]["content"]
         else:
-            r = await c.post(
-                _chat_url(),
-                headers=headers,
-                json={
-                    "model": OLLAMA_LLM_MODEL,
-                    "messages": messages,
-                    "stream": False,
-                    "think": False,
-                    "options": {
-                        "temperature": 0.0,
-                        "top_p": 0.85,
-                        "top_k": 30,
-                        "repeat_penalty": 1.15,
-                        "num_ctx": 8192
-                    }
-                },
-            )
-            if r.status_code == 401 and OPENWEBUI_PASSWORD and OPENWEBUI_USER:
-                headers = await _api_headers(force_refresh=True)
-                r = await c.post(
-                    _chat_url(),
-                    headers=headers,
-                    json={
-                        "model": OLLAMA_LLM_MODEL,
-                        "messages": messages,
-                        "stream": False,
-                        "think": False,
-                        "options": {
-                            "temperature": 0.0,
-                            "top_p": 0.85,
-                            "top_k": 30,
-                            "repeat_penalty": 1.15,
-                            "num_ctx": 8192
-                        }
-                    },
-                )
-            r.raise_for_status()
-            content = r.json().get("message", {}).get("content", "")
+            response = await _post(payload_ollama)
+            content = response.json().get("message", {}).get("content", "")
+
         if not content:
             raise ValueError("LLM вернул пустой ответ")
         return content
 
 
-async def _rewrite_query(q: str) -> str:
-    return q  # отключено для qwen3
+# ── Query rewrite ─────────────────────────────────────────────────────────────
 
+async def _rewrite_query(q: str) -> str:
+    """
+    Перефразирует вопрос для улучшения поиска.
+    Включается через QUERY_REWRITE_ENABLED в config.json.
+    По умолчанию выключено — добавляет ~1-2с латентности.
+    """
+    if not QUERY_REWRITE_ENABLED:
+        return q
+    try:
+        rewritten = await _chat(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "Ты — оптимизатор поисковых запросов.\n"
+                        "Перефразируй вопрос пользователя в краткий поисковый запрос (3–10 слов).\n"
+                        "Убери вводные слова ('скажи мне', 'объясни', 'как'), оставь только ключевые термины.\n"
+                        "Отвечай ТОЛЬКО переформулированным запросом, без пояснений и кавычек.\n"
+                        "Отвечай на том же языке, что и вопрос."
+                    ),
+                },
+                {"role": "user", "content": q},
+            ],
+            max_tokens=60,
+        )
+        rewritten = rewritten.strip().strip("\"'«»").strip()
+        if not rewritten or len(rewritten) > len(q) * 2:
+            return q
+        return rewritten
+    except Exception as e:
+        log.warning("Query rewrite failed: %s", e)
+        return q
+
+
+# ── Faithfulness check ────────────────────────────────────────────────────────
+
+def _is_faithful(answer: str, context: str) -> bool:
+    """
+    Быстрая лексическая проверка: ответ должен опираться на лексику контекста.
+    Работает без LLM-вызова — не увеличивает латентность.
+    Контекст не обрезается: проверяем по всему тексту, а не первым 3000 символам.
+    """
+
+    def normalize(text: str) -> str:
+        return re.sub(r"\s+", " ", text.lower()).strip()
+
+    ctx_norm = normalize(context)
+    ans_norm = normalize(answer)
+    words = [w for w in re.findall(r"[A-Za-zА-Яа-яЁё0-9-]{4,}", ans_norm)]
+    if not words:
+        return True
+    overlap = sum(1 for w in words if w in ctx_norm)
+    ratio = overlap / len(words)
+    if ratio < 0.3:
+        log.warning(
+            "Faithfulness check: low overlap %.0f%% (%d/%d words)",
+            ratio * 100,
+            overlap,
+            len(words),
+        )
+        return False
+    return True
+
+
+# ── Загрузка документов ───────────────────────────────────────────────────────
+
+def _load_documents(path: Path):
+    suffix = path.suffix.lower()
+    if suffix == ".msg":
+        try:
+            import extract_msg
+            from llama_index.core.schema import Document
+        except ImportError as e:
+            raise RuntimeError("MSG support requires 'extract-msg' package") from e
+
+        message = extract_msg.Message(str(path))
+        parts = []
+        subject = (message.subject or "").strip()
+        sender = (message.sender or "").strip()
+        date = (message.date or "").strip()
+        body = (message.body or "").strip()
+        if subject:
+            parts.append(f"Subject: {subject}")
+        if sender:
+            parts.append(f"From: {sender}")
+        if date:
+            parts.append(f"Date: {date}")
+        if body:
+            parts.append("")
+            parts.append(body)
+        text = "\n".join(parts).strip()
+        if not text:
+            raise ValueError("No text extracted from MSG file")
+        return [Document(text=text, metadata={"filename": path.name})]
+
+    from llama_index.core import SimpleDirectoryReader
+
+    return SimpleDirectoryReader(input_files=[str(path)]).load_data()
+
+
+# ── Индексирование ────────────────────────────────────────────────────────────
 
 async def _run_indexing(filename: str, dest: Path):
-    lock = _indexing_locks.setdefault(filename, asyncio.Lock())
+    lock = asyncio.Lock()
+    _indexing_locks[filename] = lock
+
     async with lock:
         _indexing[filename] = {
-            "status": "indexing", "chunks_done": 0, "chunks_total": 0,
-            "error": None, "started_at": datetime.utcnow().isoformat(), "finished_at": None,
+            "status": "indexing",
+            "chunks_done": 0,
+            "chunks_total": 0,
+            "error": None,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "finished_at": None,
         }
         try:
             from llama_index.core.node_parser import SentenceSplitter
 
-            loop = asyncio.get_event_loop()
-            docs = await loop.run_in_executor(
-                None,
-                lambda: _load_documents(dest)
-            )
+            loop = asyncio.get_running_loop()
+            docs = await loop.run_in_executor(None, lambda: _load_documents(dest))
             if not docs:
                 raise ValueError("No text extracted from file")
 
             splitter = SentenceSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
             nodes = await loop.run_in_executor(
                 None,
-                lambda: splitter.get_nodes_from_documents(docs)
+                lambda: splitter.get_nodes_from_documents(docs),
             )
 
-            total = len(nodes)
+            texts = [node.text.strip() for node in nodes if node.text.strip()]
+            total = len(texts)
             _indexing[filename]["chunks_total"] = total
-            log.info(f"[{filename}] {total} chunks (SentenceSplitter)")
+            log.info("[%s] %d chunks (SentenceSplitter)", filename, total)
 
             done = 0
             new_records: list[dict] = []
-            for i, node in enumerate(nodes):
-                text = node.text.strip()
-                if not text:
-                    continue
-                emb = await _embed(text)
-                if emb is None:
-                    log.warning(f"[{filename}] skipping chunk {i} (embed 400)")
-                    continue
-                new_records.append({
-                    "id": f"{filename}_{i}",
-                    "filename": filename,
-                    "text": text,
-                    "embedding": _normalize_embedding(emb),
-                })
-                done += 1
+
+            for batch_start in range(0, total, EMBED_BATCH_SIZE):
+                batch_texts = texts[batch_start: batch_start + EMBED_BATCH_SIZE]
+                embeddings = await _embed_batch(batch_texts)
+
+                for offset, (text, emb) in enumerate(zip(batch_texts, embeddings)):
+                    if emb is None:
+                        log.warning("[%s] skipping chunk %d (embed 400)", filename, batch_start + offset)
+                        continue
+                    new_records.append(
+                        {
+                            "id": f"{filename}_{batch_start + offset}",
+                            "filename": filename,
+                            "text": text,
+                            "embedding": _normalize_embedding(emb),
+                        }
+                    )
+                    done += 1
+
                 _indexing[filename]["chunks_done"] = done
-                if done % 20 == 0:
-                    log.info(f"[{filename}] {done}/{total}")
+                log.info("[%s] embedded %d/%d", filename, done, total)
 
             await _replace_document_records(filename, new_records)
 
-            _indexing[filename].update({
-                "status": "ready", "chunks_done": done,
-                "finished_at": datetime.utcnow().isoformat(),
-            })
-            log.info(f"[{filename}] done: {done} chunks")
+            _indexing[filename].update(
+                {
+                    "status": "ready",
+                    "chunks_done": done,
+                    "finished_at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+            log.info("[%s] done: %d chunks", filename, done)
 
         except Exception as e:
-            log.error(f"[{filename}] failed: {e}")
-            _indexing[filename].update({
-                "status": "error", "error": str(e),
-                "finished_at": datetime.utcnow().isoformat(),
-            })
+            log.error("[%s] failed: %s", filename, e)
+            _indexing[filename].update(
+                {
+                    "status": "error",
+                    "error": str(e),
+                    "finished_at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+        finally:
+            _indexing_locks.pop(filename, None)
 
+
+# ── FastAPI ───────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    log.info(f"FAISS index: {_chunk_count()} chunks")
+    """
+    При старте всегда перестраиваем FAISS из JSON — это дешевле, чем
+    доверять файлу на диске, который мог рассинхронизироваться (в том числе
+    при совпадении ntotal, но изменённом содержимом после сбоя).
+    """
+    global _faiss_index
+    async with _records_lock:
+        records = _load_records_sync()
+        if records:
+            log.info("Rebuilding FAISS index from JSON (%d records)...", len(records))
+            _rebuild_faiss_index_sync(records)
+        else:
+            _faiss_index = None
+            log.info("Index is empty, skipping FAISS build.")
+    log.info("FAISS index ready: %d chunks", len(records))
     yield
 
-app = FastAPI(title="RAG Ollama API v3.5", version="3.5.0", lifespan=lifespan)
+
+app = FastAPI(title="RAG Ollama API v4.4", version="4.4.0", lifespan=lifespan)
 
 
 class AskRequest(BaseModel):
     question: str
     top_k: Optional[int] = None
+
 
 class AskResponse(BaseModel):
     answer: str
@@ -554,16 +837,20 @@ class AskResponse(BaseModel):
     chunks_used: int
     download_urls: dict[str, str]
     raw_chunks: list[str]
+    rewritten_query: Optional[str] = None
+
 
 class UploadResponse(BaseModel):
     filename: str
     status: str
+
 
 class DocumentInfo(BaseModel):
     filename: str
     chunks: int
     indexing_status: str
     download_url: str
+
 
 class IndexingStatus(BaseModel):
     filename: str
@@ -575,6 +862,7 @@ class IndexingStatus(BaseModel):
     started_at: Optional[str]
     finished_at: Optional[str]
 
+
 class StatusResponse(BaseModel):
     total_chunks: int
     total_documents: int
@@ -585,58 +873,80 @@ class StatusResponse(BaseModel):
 
 @app.get("/status", response_model=StatusResponse)
 async def status():
-    total = _chunk_count()
-    docs = len(_document_chunk_counts())
+    total = await _chunk_count()
+    docs = len(await _document_chunk_counts())
     return StatusResponse(
-        total_chunks=total, total_documents=docs,
-        llm_model=OLLAMA_LLM_MODEL, embed_model=OLLAMA_EMBED_MODEL,
+        total_chunks=total,
+        total_documents=docs,
+        llm_model=OLLAMA_LLM_MODEL,
+        embed_model=OLLAMA_EMBED_MODEL,
         ollama_url=OLLAMA_BASE_URL,
     )
 
+
 @app.get("/documents", response_model=list[DocumentInfo])
 async def list_documents():
-    counts = _document_chunk_counts()
+    counts = await _document_chunk_counts()
     for fn in _indexing:
         counts.setdefault(fn, 0)
     result = []
     for fn, n in sorted(counts.items()):
         st = _indexing.get(fn, {}).get("status", "ready" if n > 0 else "unknown")
-        result.append(DocumentInfo(
-            filename=fn, chunks=n, indexing_status=st,
-            download_url=f"{BASE_URL}/documents/{fn}/download",
-        ))
+        result.append(
+            DocumentInfo(
+                filename=fn,
+                chunks=n,
+                indexing_status=st,
+                download_url=f"{BASE_URL}/documents/{fn}/download",
+            )
+        )
     return result
+
 
 @app.post("/documents", response_model=UploadResponse, status_code=202)
 async def upload_document(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
-    suffix = Path(file.filename).suffix.lower()
+    filename = _safe_filename(file.filename)
+    suffix = Path(filename).suffix.lower()
     if suffix not in SUPPORTED:
-        raise HTTPException(400, f"Unsupported type '{suffix}'. Supported: {', '.join(sorted(SUPPORTED))}")
-    if _indexing.get(file.filename, {}).get("status") == "indexing":
-        raise HTTPException(409, f"'{file.filename}' is already being indexed")
-    dest = FILES_DIR / file.filename
-    dest.write_bytes(await file.read())
-    background_tasks.add_task(_run_indexing, file.filename, dest)
-    return UploadResponse(filename=file.filename, status="indexing_started")
+        raise HTTPException(
+            400,
+            f"Unsupported type '{suffix}'. Supported: {', '.join(sorted(SUPPORTED))}",
+        )
+    if _indexing.get(filename, {}).get("status") == "indexing":
+        raise HTTPException(409, f"'{filename}' is already being indexed")
+    dest = FILES_DIR / filename
+    async with aiofiles.open(dest, "wb") as f:
+        while chunk := await file.read(1024 * 256):
+            await f.write(chunk)
+    background_tasks.add_task(_run_indexing, filename, dest)
+    return UploadResponse(filename=filename, status="indexing_started")
+
 
 @app.get("/documents/{filename}/download")
 async def download_document(filename: str):
+    filename = _safe_filename(filename)
     path = FILES_DIR / filename
     if not path.exists():
         raise HTTPException(404, f"File '{filename}' not found")
     return FileResponse(path, filename=filename)
 
+
 @app.get("/documents/{filename}/status", response_model=IndexingStatus)
 async def document_status(filename: str):
+    filename = _safe_filename(filename)
     info = _indexing.get(filename)
     if info is None:
-        chunks = len(_document_records(filename))
+        chunks = len(await _document_records(filename))
         if chunks:
             return IndexingStatus(
-                filename=filename, status="ready",
-                chunks_done=chunks, chunks_total=chunks,
-                progress_pct=100.0, error=None,
-                started_at=None, finished_at=None,
+                filename=filename,
+                status="ready",
+                chunks_done=chunks,
+                chunks_total=chunks,
+                progress_pct=100.0,
+                error=None,
+                started_at=None,
+                finished_at=None,
             )
         raise HTTPException(404, f"Document '{filename}' not found")
     total = info["chunks_total"] or 1
@@ -651,8 +961,10 @@ async def document_status(filename: str):
         finished_at=info.get("finished_at"),
     )
 
+
 @app.delete("/documents/{filename}")
 async def delete_document(filename: str):
+    filename = _safe_filename(filename)
     if _indexing.get(filename, {}).get("status") == "indexing":
         raise HTTPException(409, f"'{filename}' is currently being indexed")
     removed = await _delete_document_records(filename)
@@ -662,58 +974,63 @@ async def delete_document(filename: str):
     _indexing.pop(filename, None)
     return {"filename": filename, "chunks_removed": removed}
 
+
 @app.post("/ask", response_model=AskResponse)
 async def ask(req: AskRequest):
-    if _chunk_count() == 0:
+    if await _chunk_count() == 0:
         raise HTTPException(503, "Index is empty. Upload documents first via POST /documents")
 
-    top_k = req.top_k or TOP_K
+    raw_top_k = req.top_k
+    if raw_top_k is not None and (not isinstance(raw_top_k, int) or raw_top_k < 1):
+        raise HTTPException(400, f"top_k must be a positive integer, got: {raw_top_k}")
+    top_k = max(1, raw_top_k or TOP_K)
 
-    # 1. Query rewrite
     rewritten = await _rewrite_query(req.question)
-    rewritten = rewritten.replace('"', '')
-    # Убираем нелатинские/некириллические символы (китайский и т.д.)
-    rewritten = re.sub(r'[^-ɏЀ-ӿ\s]', '', rewritten).strip()
-    # Для поиска используем оригинальный вопрос — rewrite может добавлять мусор
-    search_query = req.question
+    log.info("Query rewrite: %r → %r", req.question, rewritten)
 
-    # 2. Векторный поиск
     try:
-        q_emb = await _embed(search_query)
+        q_emb = await _embed(rewritten)
         if q_emb is None:
             raise ValueError("embed returned None")
     except Exception as e:
         raise HTTPException(502, f"Embedding API error: {e}")
 
-    results = _search_records(_normalize_embedding(q_emb), top_k)
+    results = await _search_records(rewritten, _normalize_embedding(q_emb), top_k)
 
-    docs      = results["documents"][0]
-    metas     = results["metadatas"][0]
+    docs = results["documents"][0]
+    metas = results["metadatas"][0]
     distances = results["distances"][0]
 
     if not docs:
         return AskResponse(
             answer="Информация в документах не найдена.",
-            sources=[], chunks_used=0, download_urls={}, raw_chunks=[]
+            sources=[],
+            chunks_used=0,
+            download_urls={},
+            raw_chunks=[],
+            rewritten_query=rewritten,
         )
 
     best_sim = 1 - distances[0]
-    log.info(f"Best similarity: {best_sim:.3f}")
+    log.info("Best similarity: %.3f", best_sim)
     if best_sim < SIM_THRESHOLD:
         return AskResponse(
             answer="Информация в документах не найдена.",
-            sources=[], chunks_used=0, download_urls={}, raw_chunks=[]
+            sources=[],
+            chunks_used=0,
+            download_urls={},
+            raw_chunks=[],
+            rewritten_query=rewritten,
         )
 
-    # 3. Используем top-k векторных чанков, но отсекаем одиночные "хвосты" из чужих документов
     doc_counts: dict[str, int] = {}
     for meta in metas:
         fn = meta["filename"]
         doc_counts[fn] = doc_counts.get(fn, 0) + 1
 
     primary_filename = metas[0]["filename"]
-    all_docs = []
-    all_metas = []
+    all_docs: list[str] = []
+    all_metas: list[dict] = []
     for doc, meta in zip(docs, metas):
         fn = meta["filename"]
         if fn == primary_filename or doc_counts.get(fn, 0) >= 2:
@@ -726,57 +1043,51 @@ async def ask(req: AskRequest):
     )
     sources = list(dict.fromkeys(m["filename"] for m in all_metas))
 
-    # 4. LLM ответ
     try:
-        answer = await _chat([
-            {
-                "role": "system",
-                "content": (
-                    "Отвечай только на русском языке.\n"
-                    "Контекст ниже — единственный источник правды.\n"
-                    "Строго запрещено придумывать шаги, роли, ограничения, числа, лимиты, сроки и требования, которых нет в контексте.\n"
-                    "Строго запрещено объединять информацию из разных фрагментов, если связь между ними не очевидна из текста.\n"
-                    "Если в контексте нет прямого ответа на вопрос, ответь ровно одной фразой: Информация в документах не найдена.\n"
-                    "Если ответ есть, дай 3-5 коротких пунктов по шагам, только по контексту.\n"
-                    "Отвечай по существу, без введения и без рассуждений.\n"
-                    "Не пиши фразы вроде: 'Давайте разберем', 'Вот пошаговая инструкция', 'Based on the provided documentation', 'Okay'.\n"
-                    "Не переводи термины на английский и не смешивай языки.\n"
-                    "Если есть сомнение, лучше ответь: Информация в документах не найдена."
-                )
-            },
-            {
-                "role": "user",
-                "content": f"Контекст:\n\n{context}\n\nВопрос: {req.question}"
-            },
-        ])
+        answer = await _chat(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "Отвечай только на русском языке.\n"
+                        "Контекст ниже — единственный источник правды.\n"
+                        "Строго запрещено придумывать шаги, роли, ограничения, числа, лимиты, сроки и требования, которых нет в контексте.\n"
+                        "Строго запрещено объединять информацию из разных фрагментов, если связь между ними не очевидна из текста.\n"
+                        "Если в контексте нет прямого ответа на вопрос, ответь ровно одной фразой: Информация в документах не найдена.\n"
+                        "Если ответ есть, дай 3-5 коротких пунктов по шагам, только по контексту.\n"
+                        "Отвечай по существу, без введения и без рассуждений.\n"
+                        "Не пиши фразы вроде: 'Давайте разберем', 'Вот пошаговая инструкция', 'Based on the provided documentation', 'Okay'.\n"
+                        "Не переводи термины на английский и не смешивай языки.\n"
+                        "Если есть сомнение, лучше ответь: Информация в документах не найдена."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": f"Контекст:\n\n{context}\n\nВопрос: {req.question}",
+                },
+            ]
+        )
     except Exception as e:
         raise HTTPException(502, f"Chat API error: {e}")
 
-    log.info(f"Raw answer: {answer[:200]!r}")
+    log.info("Raw answer: %r", answer[:200])
 
     answer_clean = answer.strip()
-    for q in ['"', "'", "«", "»"]:
-        answer_clean = answer_clean.strip(q)
+    for quote in ['"', "'", "«", "»"]:
+        answer_clean = answer_clean.strip(quote)
     answer = answer_clean.strip().replace("\\n", "\n")
 
     if answer != "Информация в документах не найдена.":
-        def normalize(t: str) -> str:
-            return re.sub(r"\s+", " ", t.lower()).strip()
+        if not _is_faithful(answer, context):
+            log.warning("Faithfulness check failed — suppressing answer")
+            answer = "Информация в документах не найдена."
 
-        ctx_norm = normalize(context)
-        ans_norm = normalize(answer)
-
-        # Мягкая проверка: ответ должен опираться на лексику из контекста.
-        if ans_norm:
-            words = [w for w in re.findall(r"[A-Za-zА-Яа-яЁё0-9-]{3,}", ans_norm) if len(w) > 3]
-            overlap = sum(1 for w in words if w in ctx_norm)
-            if words and overlap < max(2, int(len(words) * 0.3)):
-                log.warning(f"Hallucination: low overlap ({overlap}/{len(words)})")
-                answer = "Информация в документах не найдена."
     download_urls = {s: f"{BASE_URL}/documents/{s}/download" for s in sources}
     return AskResponse(
-        answer=answer, sources=sources,
+        answer=answer,
+        sources=sources,
         chunks_used=len(all_docs),
         download_urls=download_urls,
-        raw_chunks=all_docs[:3]
+        raw_chunks=all_docs[:3],
+        rewritten_query=rewritten,
     )
