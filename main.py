@@ -1,10 +1,14 @@
 """
-RAG сервис v4.4 — production pipeline
+RAG сервис v5.0 — production pipeline
 - FAISS (IndexFlatIP) + LlamaIndex SentenceSplitter
-- Vector search + BM25 внутри RRF fusion по vector shortlist
-  (не полноценный hybrid retrieval по всему корпусу — BM25 работает только
-   поверх vector shortlist; это осознанный компромисс без доп. зависимостей)
-- Query rewrite через LLM (опционально, QUERY_REWRITE_ENABLED=false по умолчанию)
+- Полноценный hybrid retrieval: FAISS vector search + глобальный BM25
+  по всему корпусу, объединение через RRF fusion
+- BM25 с prefix-stemming (5-char prefix) для морфологических вариантов
+  русского языка ("согласовать" ↔ "согласования")
+- Document-aware context: соседние чанки того же документа подтягиваются
+  автоматически, чтобы ответы по большим документам не строились на
+  изолированных фрагментах
+- Адаптивный chunking (cheatsheet 350/50 vs manual 800/120)
 - Overlap-эвристика защиты от галлюцинаций (без доп. LLM-вызова)
 - Батчевые эмбеддинги (×N быстрее индексирования)
 - Thread-safe in-memory кэш записей; index.json с recovery при повреждении
@@ -82,7 +86,7 @@ EMBED_BATCH_SIZE = int(CONFIG.get("EMBED_BATCH_SIZE", 32))
 # Включить query rewrite (добавляет 1 LLM-вызов, может улучшить recall)
 QUERY_REWRITE_ENABLED = bool(CONFIG.get("QUERY_REWRITE_ENABLED", False))
 # Вес BM25 при RRF fusion (0.0 — только вектор, 1.0 — только BM25)
-# BM25 работает поверх vector shortlist, не по всему корпусу
+# BM25 работает глобально по всему корпусу с prefix-stemming
 BM25_WEIGHT = float(CONFIG.get("BM25_WEIGHT", 0.5))
 
 os.environ["ANONYMIZED_TELEMETRY"] = "FALSE"
@@ -287,13 +291,38 @@ def _safe_filename(filename: str) -> str:
 
 
 def _bm25_scores(query: str, texts: list[str], k1: float = 1.5, b: float = 0.75) -> list[float]:
-    """Минималистичный BM25 без внешних зависимостей."""
+    """
+    BM25 с prefix-stemming: для токенов ≥5 символов при отсутствии точного
+    совпадения проверяется совпадение первых 5 символов.  Это покрывает
+    основные морфологические вариации русского языка без внешнего стеммера.
+    """
+    _STEM_LEN = 5
     tokenize = lambda t: re.findall(r"[A-Za-zА-Яа-яЁё0-9]+", t.lower())
     q_tokens = set(tokenize(query))
     if not q_tokens:
         return [0.0] * len(texts)
 
     tokenized = [tokenize(t) for t in texts]
+
+    # Precompute per-document: exact token set + prefix set
+    token_sets = [set(toks) for toks in tokenized]
+    prefix_sets = [
+        set(tok[:_STEM_LEN] for tok in toks if len(tok) >= _STEM_LEN)
+        for toks in tokenized
+    ]
+
+    # Precompute DF for each query term (exact OR prefix match)
+    df_cache: dict[str, int] = {}
+    for term in q_tokens:
+        df = 0
+        term_prefix = term[:_STEM_LEN] if len(term) >= _STEM_LEN else None
+        for i in range(len(tokenized)):
+            if term in token_sets[i]:
+                df += 1
+            elif term_prefix and term_prefix in prefix_sets[i]:
+                df += 1
+        df_cache[term] = df
+
     doc_lens = [len(t) for t in tokenized]
     avg_dl = sum(doc_lens) / max(len(doc_lens), 1)
     n_docs = len(texts)
@@ -303,14 +332,22 @@ def _bm25_scores(query: str, texts: list[str], k1: float = 1.5, b: float = 0.75)
         tf_map: dict[str, int] = {}
         for tok in tokens:
             tf_map[tok] = tf_map.get(tok, 0) + 1
+        prefix_tf: dict[str, int] = {}
+        for tok in tokens:
+            if len(tok) >= _STEM_LEN:
+                p = tok[:_STEM_LEN]
+                prefix_tf[p] = prefix_tf.get(p, 0) + 1
+
         score = 0.0
         dl = len(tokens)
         for term in q_tokens:
-            df = sum(1 for toks in tokenized if term in toks)
+            df = df_cache[term]
             if df == 0:
                 continue
             idf = math.log((n_docs - df + 0.5) / (df + 0.5) + 1)
             tf = tf_map.get(term, 0)
+            if tf == 0 and len(term) >= _STEM_LEN:
+                tf = prefix_tf.get(term[:_STEM_LEN], 0)
             tf_norm = tf * (k1 + 1) / (tf + k1 * (1 - b + b * dl / avg_dl))
             score += idf * tf_norm
         scores.append(score)
@@ -355,7 +392,7 @@ def _rrf_fusion(
     return sorted(scores, key=lambda x: scores[x], reverse=True)
 
 
-async def _search_records(lexical_query: str, query_embedding: list[float], top_k: int) -> dict:
+async def _search_records(query: str, query_embedding: list[float], top_k: int) -> dict:
     """Гибридный поиск: FAISS-кандидаты + глобальные lexical-кандидаты + RRF fusion."""
     async with _records_lock:
         records = _load_records_sync()
@@ -380,9 +417,9 @@ async def _search_records(lexical_query: str, query_embedding: list[float], top_
 
     lexical_fetch_k = min(max(top_k * 8, 12), len(records))
     lexical_texts = [f"{record['filename']} {record['text']}" for record in records]
-    lexical_scores = _bm25_scores(lexical_query, lexical_texts)
+    lexical_scores = _bm25_scores(query, lexical_texts)
     lexical_scores = [
-        score + _filename_match_boost(lexical_query, record["filename"])
+        score + _filename_match_boost(query, record["filename"])
         for score, record in zip(lexical_scores, records)
     ]
     lexical_ids = [
@@ -403,104 +440,88 @@ async def _search_records(lexical_query: str, query_embedding: list[float], top_
         record = id_to_record[doc_id]
         ids.append(record["id"])
         docs.append(record["text"])
-        metas.append({"filename": record["filename"], "chunk_idx": record.get("chunk_idx", -1)})
+        metas.append({
+            "filename": record["filename"],
+            "chunk_index": record.get("chunk_index", 0),
+        })
         distances.append(vector_distances.get(doc_id, 1.0))
 
     return {"ids": [ids], "documents": [docs], "metadatas": [metas], "distances": [distances]}
 
 
-async def _build_document_aware_context(
-    docs: list[str],
-    metas: list[dict],
-    distances: list[float],
-    retrieval_top_k: int,
-    max_docs: int = 5,
-    relative_threshold: float = 0.75,
+def _build_document_aware_context(
+    result_ids: list[str],
+    records: list[dict],
+    budget: int,
 ) -> tuple[list[str], list[dict]]:
     """
-    Собирает контекст по схеме:
-    - главный документ получает расширенный бюджет и соседние чанки
-    - второстепенные документы дают точечные подтверждения
+    Расширяет найденные чанки соседними чанками того же документа (±1).
+    Это критично для больших документов: если вопрос затрагивает процесс
+    из нескольких шагов, ответ не должен строиться на изолированных фрагментах.
+
+    Документы обрабатываются в порядке ранжирования — наиболее релевантный
+    документ получает приоритет по бюджету.  Чанки внутри документа
+    добавляются в порядке chunk_index (естественный порядок текста).
+
+    budget — максимальное число чанков в итоговом контексте.
     """
-    if not docs:
-        return [], []
+    id_to_record = {r["id"]: r for r in records}
 
-    buckets: dict[str, list[tuple[float, str, dict]]] = {}
-    for doc, meta, distance in zip(docs, metas, distances):
-        filename = meta["filename"]
-        score = 1.0 - distance
-        buckets.setdefault(filename, []).append((score, doc, meta))
+    # Сгруппировать выбранные чанки по документу (с сохранением порядка ранжирования)
+    doc_selected: dict[str, list[int]] = {}
+    doc_order: list[str] = []
+    for rid in result_ids:
+        rec = id_to_record.get(rid)
+        if not rec:
+            continue
+        fn = rec["filename"]
+        ci = rec.get("chunk_index", 0)
+        if fn not in doc_selected:
+            doc_selected[fn] = []
+            doc_order.append(fn)
+        doc_selected[fn].append(ci)
 
-    ranked_docs: list[tuple[str, float, int]] = []
-    for filename, items in buckets.items():
-        items.sort(key=lambda x: x[0], reverse=True)
-        best_score = items[0][0]
-        chunk_count = len(items)
-        doc_score = best_score + 0.12 * min(chunk_count, 4)
-        ranked_docs.append((filename, doc_score, chunk_count))
+    # Построить карту чанков для каждого релевантного документа
+    doc_chunks: dict[str, dict[int, dict]] = {}
+    for rec in records:
+        fn = rec["filename"]
+        if fn not in doc_selected:
+            continue
+        ci = rec.get("chunk_index", 0)
+        doc_chunks.setdefault(fn, {})[ci] = rec
 
-    ranked_docs.sort(key=lambda x: x[1], reverse=True)
-    if not ranked_docs:
-        return [], []
+    used = 0
+    context_texts: list[str] = []
+    context_metas: list[dict] = []
 
-    leader_score = ranked_docs[0][1]
-    selected_filenames = [
-        filename
-        for filename, doc_score, _chunk_count in ranked_docs[:max_docs]
-        if doc_score >= leader_score * relative_threshold
-    ]
+    for fn in doc_order:
+        if used >= budget:
+            break
 
-    main_filename = selected_filenames[0]
-    secondary_filenames = selected_filenames[1:]
-    main_doc_budget = min(max(retrieval_top_k, 3), 6)
-    secondary_doc_budget = 1
+        chunks_map = doc_chunks.get(fn, {})
+        if not chunks_map:
+            continue
+        max_ci = max(chunks_map.keys())
+        selected = sorted(doc_selected[fn])
 
-    selected_docs: list[str] = []
-    selected_metas: list[dict] = []
+        # Расширить окно: ±1 сосед для каждого выбранного чанка
+        expanded = set()
+        for ci in selected:
+            for delta in range(-1, 2):
+                neighbor = ci + delta
+                if 0 <= neighbor <= max_ci and neighbor in chunks_map:
+                    expanded.add(neighbor)
 
-    main_doc_records = sorted(
-        await _document_records(main_filename),
-        key=lambda x: x.get("chunk_idx", 0),
-    )
-    main_by_idx = {record.get("chunk_idx", idx): record for idx, record in enumerate(main_doc_records)}
-    main_items = buckets[main_filename]
-    main_items.sort(key=lambda x: x[0], reverse=True)
-
-    chosen_indices: list[int] = []
-    seen_indices: set[int] = set()
-
-    for _score, _doc, meta in main_items[:2]:
-        chunk_idx = meta.get("chunk_idx", -1)
-        for neighbor_idx in (chunk_idx - 1, chunk_idx, chunk_idx + 1):
-            if neighbor_idx in main_by_idx and neighbor_idx not in seen_indices:
-                seen_indices.add(neighbor_idx)
-                chosen_indices.append(neighbor_idx)
-            if len(chosen_indices) >= main_doc_budget:
+        # Добавить чанки в порядке их следования в документе
+        for ci in sorted(expanded):
+            if used >= budget:
                 break
-        if len(chosen_indices) >= main_doc_budget:
-            break
+            rec = chunks_map[ci]
+            context_texts.append(rec["text"])
+            context_metas.append({"filename": fn, "chunk_index": ci})
+            used += 1
 
-    for _score, _doc, meta in main_items:
-        chunk_idx = meta.get("chunk_idx", -1)
-        if chunk_idx in main_by_idx and chunk_idx not in seen_indices:
-            seen_indices.add(chunk_idx)
-            chosen_indices.append(chunk_idx)
-        if len(chosen_indices) >= main_doc_budget:
-            break
-
-    for chunk_idx in sorted(chosen_indices):
-        record = main_by_idx[chunk_idx]
-        selected_docs.append(record["text"])
-        selected_metas.append({"filename": record["filename"], "chunk_idx": record.get("chunk_idx", chunk_idx)})
-
-    for filename in secondary_filenames:
-        items = buckets[filename]
-        items.sort(key=lambda x: x[0], reverse=True)
-        for _score, doc, meta in items[:secondary_doc_budget]:
-            selected_docs.append(doc)
-            selected_metas.append(meta)
-
-    return selected_docs, selected_metas
+    return context_texts, context_metas
 
 
 # ── Auth / HTTP ───────────────────────────────────────────────────────────────
@@ -736,46 +757,14 @@ async def _chat(messages: list[dict], max_tokens: int = 400) -> str:
 
 # ── Query rewrite ─────────────────────────────────────────────────────────────
 
-async def _expand_query_for_lexical_search(q: str) -> list[str]:
+async def _rewrite_query(q: str) -> str:
     """
-    Генерирует 3-5 поисковых формулировок того же смысла.
-    Используется только для lexical-поиска; FAISS остается на исходном вопросе.
+    Query rewrite отключён.  Морфологические вариации покрываются
+    prefix-stemming в BM25, а семантические — FAISS.  Дополнительный
+    LLM-вызов на rewrite добавляет latency без гарантированного выигрыша
+    по recall и может подменять смысл вопроса.
     """
-    if not QUERY_REWRITE_ENABLED:
-        return [q]
-    try:
-        expanded = await _chat(
-            [
-                {
-                    "role": "system",
-                    "content": (
-                        "Ты помогаешь поиску по внутренним инструкциям.\n"
-                        "По вопросу пользователя верни 3-5 коротких поисковых формулировок.\n"
-                        "Требования:\n"
-                        "- только перефразировки того же смысла\n"
-                        "- не добавляй новые сущности, роли, процессы или термины, которых нет в вопросе\n"
-                        "- используй близкие словоформы и канцелярские варианты формулировки\n"
-                        "- каждая строка — отдельный вариант\n"
-                        "- без нумерации, без пояснений, без кавычек\n"
-                        "- язык ответа — тот же, что и у вопроса"
-                    ),
-                },
-                {"role": "user", "content": q},
-            ],
-            max_tokens=120,
-        )
-        variants: list[str] = []
-        for line in expanded.splitlines():
-            candidate = line.strip().strip("\"'«»").strip()
-            candidate = re.sub(r"^\d+[\.\)]\s*", "", candidate).strip()
-            if candidate and candidate not in variants:
-                variants.append(candidate)
-        if q not in variants:
-            variants.insert(0, q)
-        return variants[:5] if variants else [q]
-    except Exception as e:
-        log.warning("Query expansion failed: %s", e)
-        return [q]
+    return q
 
 
 # ── Faithfulness check ────────────────────────────────────────────────────────
@@ -938,7 +927,7 @@ async def _run_indexing(filename: str, dest: Path):
                         {
                             "id": f"{filename}_{batch_start + offset}",
                             "filename": filename,
-                            "chunk_idx": batch_start + offset,
+                            "chunk_index": batch_start + offset,
                             "text": text,
                             "embedding": _normalize_embedding(emb),
                         }
@@ -994,7 +983,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="RAG Ollama API v4.4", version="4.4.0", lifespan=lifespan)
+app = FastAPI(title="RAG Ollama API v5.0", version="5.0.0", lifespan=lifespan)
 
 
 class AskRequest(BaseModel):
@@ -1156,18 +1145,17 @@ async def ask(req: AskRequest):
         raise HTTPException(400, f"top_k must be a positive integer, got: {raw_top_k}")
     top_k = max(1, raw_top_k or TOP_K)
 
-    lexical_variants = await _expand_query_for_lexical_search(req.question)
-    lexical_query = " ".join(dict.fromkeys(lexical_variants))
-    log.info("Query expansion: %r → %r", req.question, lexical_variants)
+    rewritten = await _rewrite_query(req.question)
+    log.info("Query rewrite: %r → %r", req.question, rewritten)
 
     try:
-        q_emb = await _embed(req.question)
+        q_emb = await _embed(rewritten)
         if q_emb is None:
             raise ValueError("embed returned None")
     except Exception as e:
         raise HTTPException(502, f"Embedding API error: {e}")
 
-    results = await _search_records(lexical_query, _normalize_embedding(q_emb), top_k)
+    results = await _search_records(rewritten, _normalize_embedding(q_emb), top_k)
 
     docs = results["documents"][0]
     metas = results["metadatas"][0]
@@ -1180,7 +1168,7 @@ async def ask(req: AskRequest):
             chunks_used=0,
             download_urls={},
             raw_chunks=[],
-            rewritten_query=lexical_query,
+            rewritten_query=rewritten,
         )
 
     best_sim = 1 - distances[0]
@@ -1192,16 +1180,13 @@ async def ask(req: AskRequest):
             chunks_used=0,
             download_urls={},
             raw_chunks=[],
-            rewritten_query=lexical_query,
+            rewritten_query=rewritten,
         )
 
-    all_docs, all_metas = await _build_document_aware_context(
-        docs,
-        metas,
-        distances,
-        retrieval_top_k=top_k,
-        max_docs=5,
-        relative_threshold=0.75,
+    # Расширяем контекст соседними чанками (document-aware)
+    records = await _get_records()
+    all_docs, all_metas = _build_document_aware_context(
+        results["ids"][0], records, budget=top_k * 2,
     )
 
     if not all_docs:
@@ -1236,7 +1221,8 @@ async def ask(req: AskRequest):
                     "role": "user",
                     "content": f"Контекст:\n\n{context}\n\nВопрос: {req.question}",
                 },
-            ]
+            ],
+            max_tokens=800,
         )
     except Exception as e:
         raise HTTPException(502, f"Chat API error: {e}")
@@ -1259,6 +1245,6 @@ async def ask(req: AskRequest):
         sources=sources,
         chunks_used=len(all_docs),
         download_urls=download_urls,
-        raw_chunks=all_docs[:3],
-        rewritten_query=lexical_query,
+        raw_chunks=all_docs[:5],
+        rewritten_query=rewritten,
     )
