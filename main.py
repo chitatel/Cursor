@@ -891,11 +891,26 @@ def _attach_images_to_answer(
     """
     img_marker_re = re.compile(r"\[Рисунок \d+: [^\]]+\]")
 
+    # Динамические стоп-слова: слова, встречающиеся в >40% чанков — слишком общие
+    from collections import Counter
+    _base_stop = {"также", "далее", "если", "этого", "того", "может", "будет", "было", "быть", "этом"}
+    chunk_word_sets = []
+    for ct in chunks:
+        cleaned = img_marker_re.sub("", ct)
+        chunk_word_sets.append(set(re.findall(r"[А-Яа-яЁёA-Za-z0-9-]{4,}", cleaned.lower())))
+    doc_freq: Counter = Counter()
+    for ws in chunk_word_sets:
+        for w in ws:
+            doc_freq[w] += 1
+    n_chunks = max(len(chunks), 1)
+    _stop = _base_stop | {w for w, cnt in doc_freq.items() if cnt / n_chunks > 0.4}
+
     def bag(text: str) -> set[str]:
         cleaned = img_marker_re.sub("", text)
-        return set(re.findall(r"[А-Яа-яЁёA-Za-z0-9-]{4,}", cleaned.lower()))
+        words = set(re.findall(r"[А-Яа-яЁёA-Za-z0-9-]{4,}", cleaned.lower()))
+        return words - _stop
 
-    # Для каждого маркера собираем «контекст» — текст перед ним в чанке
+    # Для каждого маркера берём 1-2 предложения непосредственно перед ним
     # (marker, preceding_bag, url)
     marker_entries: list[tuple[str, set[str], str]] = []
     for chunk_text in chunks:
@@ -907,10 +922,14 @@ def _attach_images_to_answer(
             url = image_urls.get(marker)
             if not url:
                 continue
-            # Текст от предыдущего маркера (или начала чанка) до текущего
+            # Берём текст между предыдущим маркером и текущим
             start = markers_in_chunk[i - 1].end() if i > 0 else 0
-            preceding = chunk_text[start:match.start()]
-            marker_entries.append((marker, bag(preceding), url))
+            preceding = chunk_text[start:match.start()].strip()
+            # Берём последние 2 предложения — они ближе всего к рисунку
+            sentences = re.split(r"[.!?\n]+", preceding)
+            sentences = [s.strip() for s in sentences if s.strip()]
+            nearby = " ".join(sentences[-2:]) if sentences else ""
+            marker_entries.append((marker, bag(nearby), url))
 
     if not marker_entries:
         return answer
@@ -935,17 +954,23 @@ def _attach_images_to_answer(
         # Ищем лучший рисунок для этого пункта
         best_marker = None
         best_url = None
-        best_score = 0
+        best_ratio = 0.0
+        best_overlap = 0
         for marker, preceding_bag, url in marker_entries:
             if marker in used_markers:
                 continue
-            score = len(point_bag & preceding_bag)
-            if score > best_score:
-                best_score = score
+            if not preceding_bag:
+                continue
+            overlap = len(point_bag & preceding_bag)
+            ratio = overlap / min(len(point_bag), len(preceding_bag))
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best_overlap = overlap
                 best_marker = marker
                 best_url = url
 
-        if best_marker and best_score >= 2:
+        # Порог: минимум 30% совпадения И минимум 3 значимых совпавших слова
+        if best_marker and best_ratio >= 0.3 and best_overlap >= 3:
             used_markers.add(best_marker)
             result_parts.append(f"{point}\n{best_url}")
         else:
