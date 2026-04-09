@@ -1225,6 +1225,46 @@ async def document_status(filename: str):
     )
 
 
+@app.post("/documents/{filename}/reindex")
+async def reindex_document(filename: str, background_tasks: BackgroundTasks):
+    """Переиндексировать существующий документ без повторной загрузки."""
+    filename = _safe_filename(filename)
+    dest = FILES_DIR / filename
+    if not dest.exists():
+        raise HTTPException(404, f"File '{filename}' not found")
+    if _indexing.get(filename, {}).get("status") == "indexing":
+        raise HTTPException(409, f"'{filename}' is already being indexed")
+    # Удаляем старые чанки и картинки
+    await _delete_document_records(filename)
+    images_dir = FILES_DIR / f"{Path(filename).stem}_images"
+    if images_dir.is_dir():
+        shutil.rmtree(images_dir, ignore_errors=True)
+    background_tasks.add_task(_run_indexing, filename, dest)
+    return {"filename": filename, "status": "reindexing_started"}
+
+
+@app.post("/documents/reindex-all")
+async def reindex_all(background_tasks: BackgroundTasks):
+    """Переиндексировать все документы."""
+    files = [f for f in FILES_DIR.iterdir() if f.is_file() and f.suffix.lower() in SUPPORTED]
+    if not files:
+        raise HTTPException(404, "No documents found")
+    started = []
+    skipped = []
+    for dest in files:
+        fn = dest.name
+        if _indexing.get(fn, {}).get("status") == "indexing":
+            skipped.append(fn)
+            continue
+        await _delete_document_records(fn)
+        images_dir = FILES_DIR / f"{dest.stem}_images"
+        if images_dir.is_dir():
+            shutil.rmtree(images_dir, ignore_errors=True)
+        background_tasks.add_task(_run_indexing, fn, dest)
+        started.append(fn)
+    return {"started": started, "skipped_already_indexing": skipped}
+
+
 @app.delete("/documents/{filename}")
 async def delete_document(filename: str):
     filename = _safe_filename(filename)
@@ -1324,6 +1364,7 @@ async def ask(req: AskRequest):
                         "Отвечай по существу, без введения и без рассуждений.\n"
                         "Не пиши фразы вроде: 'Давайте разберем', 'Вот пошаговая инструкция', 'Based on the provided documentation', 'Okay'.\n"
                         "Не переводи термины на английский и не смешивай языки.\n"
+                        "Если в контексте есть маркеры вида [Рисунок N: имя_файла], и они относятся к описываемому шагу или пункту — включи маркер в текст ответа как есть, чтобы пользователь видел ссылку на иллюстрацию.\n"
                         "Если есть сомнение, лучше ответь: Информация в документах не найдена."
                     ),
                 },
