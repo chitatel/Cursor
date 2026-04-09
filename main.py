@@ -25,6 +25,7 @@ import os
 import re
 import json
 import math
+import shutil
 import logging
 import asyncio
 from pathlib import Path
@@ -797,10 +798,98 @@ def _is_faithful(answer: str, context: str) -> bool:
     return True
 
 
+# ── Извлечение изображений из документов ─────────────────────────────────────
+
+def _extract_docx_with_images(path: Path) -> list:
+    """
+    Извлекает текст из .docx с сохранением изображений.
+    Изображения сохраняются в FILES_DIR/<stem>_images/img_001.png и т.д.
+    В текст вставляются маркеры [Рисунок N: img_NNN.ext] на месте картинок.
+    """
+    from docx import Document as DocxDocument
+    from docx.opc.constants import RELATIONSHIP_TYPE as RT
+    from llama_index.core.schema import Document
+
+    doc = DocxDocument(str(path))
+    stem = path.stem
+    images_dir = FILES_DIR / f"{stem}_images"
+    images_dir.mkdir(exist_ok=True)
+
+    # Собираем все inline-изображения с привязкой к параграфам
+    img_counter = 0
+    para_images: dict[int, list[str]] = {}  # para_index -> list of markers
+
+    for para_idx, para in enumerate(doc.paragraphs):
+        for run in para.runs:
+            drawing_elements = run._element.findall(
+                ".//{http://schemas.openxmlformats.org/wordprocessingml/2006/main}drawing"
+            ) + run._element.findall(
+                ".//{http://schemas.openxmlformats.org/wordprocessingml/2006/main}pict"
+            )
+            # Inline images через drawing
+            blips = run._element.findall(
+                ".//{http://schemas.openxmlformats.org/drawingml/2006/main}blip"
+            )
+            for blip in blips:
+                embed_id = blip.get(
+                    "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed"
+                )
+                if not embed_id:
+                    continue
+                try:
+                    rel = doc.part.rels[embed_id]
+                except KeyError:
+                    continue
+                img_counter += 1
+                img_data = rel.target_part.blob
+                content_type = rel.target_part.content_type
+                ext_map = {
+                    "image/png": ".png",
+                    "image/jpeg": ".jpg",
+                    "image/gif": ".gif",
+                    "image/bmp": ".bmp",
+                    "image/tiff": ".tiff",
+                    "image/x-wmf": ".wmf",
+                    "image/x-emf": ".emf",
+                }
+                ext = ext_map.get(content_type, ".png")
+                img_name = f"img_{img_counter:03d}{ext}"
+                img_path = images_dir / img_name
+                img_path.write_bytes(img_data)
+                marker = f"[Рисунок {img_counter}: {img_name}]"
+                para_images.setdefault(para_idx, []).append(marker)
+                log.info("[%s] Extracted image: %s", path.name, img_name)
+
+    # Собираем текст с маркерами
+    parts = []
+    for para_idx, para in enumerate(doc.paragraphs):
+        text = para.text.strip()
+        if text:
+            parts.append(text)
+        if para_idx in para_images:
+            for marker in para_images[para_idx]:
+                parts.append(marker)
+
+    full_text = "\n".join(parts).strip()
+    if not full_text:
+        raise ValueError("No text extracted from DOCX file")
+
+    # Удаляем папку, если картинок не нашлось
+    if img_counter == 0:
+        images_dir.rmdir()
+
+    log.info("[%s] Extracted %d images", path.name, img_counter)
+    return [Document(text=full_text, metadata={"filename": path.name})]
+
+
 # ── Загрузка документов ───────────────────────────────────────────────────────
 
 def _load_documents(path: Path):
     suffix = path.suffix.lower()
+
+    if suffix == ".docx":
+        return _extract_docx_with_images(path)
+
     if suffix == ".msg":
         try:
             import extract_msg
@@ -996,6 +1085,7 @@ class AskResponse(BaseModel):
     sources: list[str]
     chunks_used: int
     download_urls: dict[str, str]
+    image_urls: dict[str, str]
     raw_chunks: list[str]
     rewritten_query: Optional[str] = None
 
@@ -1091,6 +1181,19 @@ async def download_document(filename: str):
     return FileResponse(path, filename=filename)
 
 
+@app.get("/documents/{filename}/images/{image_name}")
+async def download_image(filename: str, image_name: str):
+    filename = _safe_filename(filename)
+    image_name = Path(image_name).name
+    if not image_name:
+        raise HTTPException(400, "Invalid image name")
+    stem = Path(filename).stem
+    img_path = FILES_DIR / f"{stem}_images" / image_name
+    if not img_path.exists():
+        raise HTTPException(404, f"Image '{image_name}' not found for '{filename}'")
+    return FileResponse(img_path, filename=image_name)
+
+
 @app.get("/documents/{filename}/status", response_model=IndexingStatus)
 async def document_status(filename: str):
     filename = _safe_filename(filename)
@@ -1131,6 +1234,10 @@ async def delete_document(filename: str):
     if not removed:
         raise HTTPException(404, f"Document '{filename}' not found in index")
     (FILES_DIR / filename).unlink(missing_ok=True)
+    # Удаляем папку с извлечёнными изображениями
+    images_dir = FILES_DIR / f"{Path(filename).stem}_images"
+    if images_dir.is_dir():
+        shutil.rmtree(images_dir, ignore_errors=True)
     _indexing.pop(filename, None)
     return {"filename": filename, "chunks_removed": removed}
 
@@ -1167,6 +1274,7 @@ async def ask(req: AskRequest):
             sources=[],
             chunks_used=0,
             download_urls={},
+            image_urls={},
             raw_chunks=[],
             rewritten_query=rewritten,
         )
@@ -1179,6 +1287,7 @@ async def ask(req: AskRequest):
             sources=[],
             chunks_used=0,
             download_urls={},
+            image_urls={},
             raw_chunks=[],
             rewritten_query=rewritten,
         )
@@ -1241,11 +1350,25 @@ async def ask(req: AskRequest):
             answer = "Информация в документах не найдена."
 
     download_urls = {s: f"{BASE_URL}/documents/{s}/download" for s in sources}
+
+    # Собираем ссылки на изображения из маркеров [Рисунок N: img_name] в чанках
+    image_urls: dict[str, str] = {}
+    img_marker_re = re.compile(r"\[Рисунок \d+: ([^\]]+)\]")
+    for doc_text, meta in zip(all_docs, all_metas):
+        for match in img_marker_re.finditer(doc_text):
+            img_name = match.group(1)
+            marker = match.group(0)
+            if marker not in image_urls:
+                image_urls[marker] = (
+                    f"{BASE_URL}/documents/{meta['filename']}/images/{img_name}"
+                )
+
     return AskResponse(
         answer=answer,
         sources=sources,
         chunks_used=len(all_docs),
         download_urls=download_urls,
+        image_urls=image_urls,
         raw_chunks=all_docs[:5],
         rewritten_query=rewritten,
     )
