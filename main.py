@@ -36,7 +36,7 @@ from datetime import datetime, timezone
 import httpx
 import numpy as np
 import aiofiles
-from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks
+from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
@@ -75,7 +75,14 @@ FAISS_INDEX_FILE = STORAGE_DIR / "index.faiss"
 TOP_K = int(_config_value("TOP_K"))
 CHUNK_SIZE = int(_config_value("CHUNK_SIZE"))
 CHUNK_OVERLAP = int(_config_value("CHUNK_OVERLAP"))
-BASE_URL = _config_value("BASE_URL")
+BASE_URL = CONFIG.get("BASE_URL", "")
+
+
+def _base_url(request: Request) -> str:
+    """Берём BASE_URL из конфига, а если пустой — из входящего запроса."""
+    if BASE_URL:
+        return BASE_URL.rstrip("/")
+    return str(request.base_url).rstrip("/")
 SIM_THRESHOLD = float(_config_value("SIM_THRESHOLD"))
 OLLAMA_API_KEY = _config_value("OLLAMA_API_KEY")
 OPENWEBUI_AUTH_PATH = _config_value("OPENWEBUI_AUTH_PATH")
@@ -1214,10 +1221,11 @@ async def status():
 
 
 @app.get("/documents", response_model=list[DocumentInfo])
-async def list_documents():
+async def list_documents(request: Request):
     counts = await _document_chunk_counts()
     for fn in _indexing:
         counts.setdefault(fn, 0)
+    base = _base_url(request)
     result = []
     for fn, n in sorted(counts.items()):
         st = _indexing.get(fn, {}).get("status", "ready" if n > 0 else "unknown")
@@ -1226,7 +1234,7 @@ async def list_documents():
                 filename=fn,
                 chunks=n,
                 indexing_status=st,
-                download_url=f"{BASE_URL}/documents/{fn}/download",
+                download_url=f"{base}/documents/{fn}/download",
             )
         )
     return result
@@ -1362,7 +1370,7 @@ async def delete_document(filename: str):
 
 
 @app.post("/ask", response_model=AskResponse)
-async def ask(req: AskRequest):
+async def ask(req: AskRequest, request: Request):
     if await _chunk_count() == 0:
         raise HTTPException(503, "Index is empty. Upload documents first via POST /documents")
 
@@ -1468,7 +1476,8 @@ async def ask(req: AskRequest):
             log.warning("Faithfulness check failed — suppressing answer")
             answer = "Информация в документах не найдена."
 
-    download_urls = {s: f"{BASE_URL}/documents/{s}/download" for s in sources}
+    base = _base_url(request)
+    download_urls = {s: f"{base}/documents/{s}/download" for s in sources}
 
     # Собираем ссылки на изображения из маркеров [Рисунок N: img_name] в чанках
     image_urls: dict[str, str] = {}
@@ -1480,7 +1489,7 @@ async def ask(req: AskRequest):
             marker = match.group(0)
             if marker not in image_urls:
                 image_urls[marker] = (
-                    f"{BASE_URL}/documents/{meta['filename']}/images/{img_name}"
+                    f"{base}/documents/{meta['filename']}/images/{img_name}"
                 )
 
     # Привязываем иллюстрации к пунктам ответа по содержимому чанков
