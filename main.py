@@ -805,6 +805,76 @@ def _is_faithful(answer: str, context: str) -> bool:
     return True
 
 
+# ── Форматирование ответа в HTML ─────────────────────────────────────────────
+
+def _answer_to_html(answer: str, image_urls: dict[str, str]) -> str:
+    """
+    Конвертирует текстовый ответ в HTML для отображения в 1С.
+    - Нумерованные пункты → <ol><li>
+    - URL картинок → <img> теги
+    - Остальной текст → <p>
+    """
+    from html import escape
+
+    lines = answer.split("\n")
+    html_parts: list[str] = []
+    in_list = False
+    numbered_re = re.compile(r"^(\d+)[\.\)]\s+(.*)")
+
+    # Собираем обратный маппинг URL → marker для image_urls
+    url_set = set(image_urls.values()) if image_urls else set()
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        # Строка — это URL картинки
+        if stripped in url_set:
+            if in_list:
+                # Вставляем картинку внутрь последнего <li>
+                html_parts.append(
+                    f'<br><img src="{escape(stripped)}" '
+                    f'style="max-width:100%; margin-top:8px; border:1px solid #ccc; border-radius:4px;">'
+                )
+            else:
+                html_parts.append(
+                    f'<p><img src="{escape(stripped)}" '
+                    f'style="max-width:100%; border:1px solid #ccc; border-radius:4px;"></p>'
+                )
+            continue
+
+        m = numbered_re.match(stripped)
+        if m:
+            if not in_list:
+                html_parts.append("<ol>")
+                in_list = True
+            html_parts.append(f"<li>{escape(m.group(2))}")
+            continue
+
+        # Обычная строка
+        if in_list:
+            html_parts.append("</li></ol>")
+            in_list = False
+        html_parts.append(f"<p>{escape(stripped)}</p>")
+
+    if in_list:
+        html_parts.append("</li></ol>")
+
+    body = "\n".join(html_parts)
+    return (
+        '<!DOCTYPE html><html><head><meta charset="utf-8">'
+        "<style>"
+        "body { font-family: Arial, sans-serif; font-size: 14px; padding: 12px; color: #333; }"
+        "ol { padding-left: 20px; }"
+        "li { margin-bottom: 10px; }"
+        "p { margin: 8px 0; }"
+        "img { display: block; }"
+        "</style>"
+        f"</head><body>{body}</body></html>"
+    )
+
+
 # ── Привязка иллюстраций к пунктам ответа ────────────────────────────────────
 
 def _attach_images_to_answer(
@@ -1168,6 +1238,7 @@ class AskRequest(BaseModel):
 
 class AskResponse(BaseModel):
     answer: str
+    answer_html: str
     sources: list[str]
     chunks_used: int
     download_urls: dict[str, str]
@@ -1395,9 +1466,13 @@ async def ask(req: AskRequest, request: Request):
     metas = results["metadatas"][0]
     distances = results["distances"][0]
 
+    _not_found = "Информация в документах не найдена."
+    _not_found_html = _answer_to_html(_not_found, {})
+
     if not docs:
         return AskResponse(
-            answer="Информация в документах не найдена.",
+            answer=_not_found,
+            answer_html=_not_found_html,
             sources=[],
             chunks_used=0,
             download_urls={},
@@ -1410,7 +1485,8 @@ async def ask(req: AskRequest, request: Request):
     log.info("Best similarity: %.3f", best_sim)
     if best_sim < SIM_THRESHOLD:
         return AskResponse(
-            answer="Информация в документах не найдена.",
+            answer=_not_found,
+            answer_html=_not_found_html,
             sources=[],
             chunks_used=0,
             download_urls={},
@@ -1494,11 +1570,14 @@ async def ask(req: AskRequest, request: Request):
                 )
 
     # Привязываем иллюстрации к пунктам ответа по содержимому чанков
-    if image_urls and answer != "Информация в документах не найдена.":
+    if image_urls and answer != _not_found:
         answer = _attach_images_to_answer(answer, all_docs, all_metas, image_urls)
+
+    answer_html = _answer_to_html(answer, image_urls)
 
     return AskResponse(
         answer=answer,
+        answer_html=answer_html,
         sources=sources,
         chunks_used=len(all_docs),
         download_urls=download_urls,
