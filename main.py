@@ -804,11 +804,12 @@ def _attach_images_to_answer(
     answer: str,
     chunks: list[str],
     chunk_metas: list[dict],
+    image_urls: dict[str, str],
 ) -> str:
     """
     Для каждого пункта ответа находим наиболее релевантный чанк по
     пересечению слов.  Если в этом чанке есть маркеры [Рисунок N: ...],
-    вставляем их сразу после пункта.
+    вставляем ссылку на изображение сразу после пункта.
 
     Каждый маркер используется максимум один раз (привязывается к пункту
     с наивысшим совпадением).
@@ -866,7 +867,9 @@ def _attach_images_to_answer(
         if best_idx >= 0 and best_score >= 2:
             for marker in chunk_images[best_idx]:
                 if marker not in used_markers:
-                    attached.append(marker)
+                    url = image_urls.get(marker)
+                    if url:
+                        attached.append(url)
                     used_markers.add(marker)
 
         if attached:
@@ -1485,7 +1488,7 @@ async def ask(req: AskRequest):
 
     # Привязываем иллюстрации к пунктам ответа по содержимому чанков
     if image_urls and answer != "Информация в документах не найдена.":
-        answer = _attach_images_to_answer(answer, all_docs, all_metas)
+        answer = _attach_images_to_answer(answer, all_docs, all_metas, image_urls)
 
     return AskResponse(
         answer=answer,
