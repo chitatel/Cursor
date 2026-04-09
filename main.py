@@ -78,7 +78,7 @@ CHUNK_OVERLAP = int(_config_value("CHUNK_OVERLAP"))
 BASE_URL = CONFIG.get("BASE_URL", "")
 
 
-def _base_url(request: Request) -> str:
+def _public_base_url(request: Request) -> str:
     """Берём BASE_URL из конфига, а если пустой — из входящего запроса."""
     if BASE_URL:
         return BASE_URL.rstrip("/")
@@ -1225,7 +1225,7 @@ async def list_documents(request: Request):
     counts = await _document_chunk_counts()
     for fn in _indexing:
         counts.setdefault(fn, 0)
-    base = _base_url(request)
+    base = _public_base_url(request)
     result = []
     for fn, n in sorted(counts.items()):
         st = _indexing.get(fn, {}).get("status", "ready" if n > 0 else "unknown")
@@ -1476,7 +1476,7 @@ async def ask(req: AskRequest, request: Request):
             log.warning("Faithfulness check failed — suppressing answer")
             answer = "Информация в документах не найдена."
 
-    base = _base_url(request)
+    base = _public_base_url(request)
     download_urls = {s: f"{base}/documents/{s}/download" for s in sources}
 
     # Собираем ссылки на изображения из маркеров [Рисунок N: img_name] в чанках
