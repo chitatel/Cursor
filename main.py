@@ -798,6 +798,85 @@ def _is_faithful(answer: str, context: str) -> bool:
     return True
 
 
+# ── Привязка иллюстраций к пунктам ответа ────────────────────────────────────
+
+def _attach_images_to_answer(
+    answer: str,
+    chunks: list[str],
+    chunk_metas: list[dict],
+) -> str:
+    """
+    Для каждого пункта ответа находим наиболее релевантный чанк по
+    пересечению слов.  Если в этом чанке есть маркеры [Рисунок N: ...],
+    вставляем их сразу после пункта.
+
+    Каждый маркер используется максимум один раз (привязывается к пункту
+    с наивысшим совпадением).
+    """
+    img_marker_re = re.compile(r"\[Рисунок \d+: [^\]]+\]")
+
+    # Собираем маркеры по чанкам
+    chunk_images: list[list[str]] = []
+    has_any = False
+    for text in chunks:
+        markers = img_marker_re.findall(text)
+        chunk_images.append(markers)
+        if markers:
+            has_any = True
+
+    if not has_any:
+        return answer
+
+    # Готовим «мешок слов» для каждого чанка (без маркеров)
+    def bag(text: str) -> set[str]:
+        cleaned = img_marker_re.sub("", text)
+        return set(re.findall(r"[А-Яа-яЁёA-Za-z0-9-]{4,}", cleaned.lower()))
+
+    chunk_bags = [bag(t) for t in chunks]
+
+    # Разбиваем ответ на пункты: по нумерации (1. / 1) / -) или по строкам
+    point_re = re.compile(r"(?:^|\n)(\d+[\.\)]\s+.*?)(?=\n\d+[\.\)]\s+|\Z)", re.DOTALL)
+    points = point_re.findall(answer)
+    if not points:
+        # Попробуем по строкам через дефис/тире
+        points = [line for line in answer.split("\n") if line.strip()]
+
+    if not points:
+        return answer
+
+    used_markers: set[str] = set()
+    result_parts: list[str] = []
+
+    for point in points:
+        point_bag = bag(point)
+        if not point_bag:
+            result_parts.append(point)
+            continue
+
+        # Находим чанк с максимальным пересечением
+        best_idx = -1
+        best_score = 0
+        for i, cb in enumerate(chunk_bags):
+            score = len(point_bag & cb)
+            if score > best_score:
+                best_score = score
+                best_idx = i
+
+        attached: list[str] = []
+        if best_idx >= 0 and best_score >= 2:
+            for marker in chunk_images[best_idx]:
+                if marker not in used_markers:
+                    attached.append(marker)
+                    used_markers.add(marker)
+
+        if attached:
+            result_parts.append(point + "\n" + "\n".join(attached))
+        else:
+            result_parts.append(point)
+
+    return "\n".join(result_parts)
+
+
 # ── Извлечение изображений из документов ─────────────────────────────────────
 
 def _extract_docx_with_images(path: Path) -> list:
@@ -1364,7 +1443,6 @@ async def ask(req: AskRequest):
                         "Отвечай по существу, без введения и без рассуждений.\n"
                         "Не пиши фразы вроде: 'Давайте разберем', 'Вот пошаговая инструкция', 'Based on the provided documentation', 'Okay'.\n"
                         "Не переводи термины на английский и не смешивай языки.\n"
-                        "Если в контексте есть маркеры вида [Рисунок N: имя_файла], и они относятся к описываемому шагу или пункту — включи маркер в текст ответа как есть, чтобы пользователь видел ссылку на иллюстрацию.\n"
                         "Если есть сомнение, лучше ответь: Информация в документах не найдена."
                     ),
                 },
@@ -1394,15 +1472,20 @@ async def ask(req: AskRequest):
 
     # Собираем ссылки на изображения из маркеров [Рисунок N: img_name] в чанках
     image_urls: dict[str, str] = {}
-    img_marker_re = re.compile(r"\[Рисунок \d+: ([^\]]+)\]")
+    img_marker_re = re.compile(r"\[Рисунок (\d+): ([^\]]+)\]")
     for doc_text, meta in zip(all_docs, all_metas):
         for match in img_marker_re.finditer(doc_text):
-            img_name = match.group(1)
+            img_num = int(match.group(1))
+            img_name = match.group(2)
             marker = match.group(0)
             if marker not in image_urls:
                 image_urls[marker] = (
                     f"{BASE_URL}/documents/{meta['filename']}/images/{img_name}"
                 )
+
+    # Привязываем иллюстрации к пунктам ответа по содержимому чанков
+    if image_urls and answer != "Информация в документах не найдена.":
+        answer = _attach_images_to_answer(answer, all_docs, all_metas)
 
     return AskResponse(
         answer=answer,
