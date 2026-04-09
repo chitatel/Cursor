@@ -807,41 +807,42 @@ def _attach_images_to_answer(
     image_urls: dict[str, str],
 ) -> str:
     """
-    Для каждого пункта ответа находим наиболее релевантный чанк по
-    пересечению слов.  Если в этом чанке есть маркеры [Рисунок N: ...],
-    вставляем ссылку на изображение сразу после пункта.
-
-    Каждый маркер используется максимум один раз (привязывается к пункту
-    с наивысшим совпадением).
+    Для каждого рисунка берём текст непосредственно перед его маркером в чанке.
+    Затем для каждого пункта ответа ищем рисунок, чей предшествующий текст
+    лучше всего совпадает с пунктом.  Так каждый рисунок привязывается
+    к конкретному шагу, а не ко всему чанку.
     """
     img_marker_re = re.compile(r"\[Рисунок \d+: [^\]]+\]")
 
-    # Собираем маркеры по чанкам
-    chunk_images: list[list[str]] = []
-    has_any = False
-    for text in chunks:
-        markers = img_marker_re.findall(text)
-        chunk_images.append(markers)
-        if markers:
-            has_any = True
-
-    if not has_any:
-        return answer
-
-    # Готовим «мешок слов» для каждого чанка (без маркеров)
     def bag(text: str) -> set[str]:
         cleaned = img_marker_re.sub("", text)
         return set(re.findall(r"[А-Яа-яЁёA-Za-z0-9-]{4,}", cleaned.lower()))
 
-    chunk_bags = [bag(t) for t in chunks]
+    # Для каждого маркера собираем «контекст» — текст перед ним в чанке
+    # (marker, preceding_bag, url)
+    marker_entries: list[tuple[str, set[str], str]] = []
+    for chunk_text in chunks:
+        markers_in_chunk = list(img_marker_re.finditer(chunk_text))
+        if not markers_in_chunk:
+            continue
+        for i, match in enumerate(markers_in_chunk):
+            marker = match.group(0)
+            url = image_urls.get(marker)
+            if not url:
+                continue
+            # Текст от предыдущего маркера (или начала чанка) до текущего
+            start = markers_in_chunk[i - 1].end() if i > 0 else 0
+            preceding = chunk_text[start:match.start()]
+            marker_entries.append((marker, bag(preceding), url))
 
-    # Разбиваем ответ на пункты: по нумерации (1. / 1) / -) или по строкам
+    if not marker_entries:
+        return answer
+
+    # Разбиваем ответ на пункты
     point_re = re.compile(r"(?:^|\n)(\d+[\.\)]\s+.*?)(?=\n\d+[\.\)]\s+|\Z)", re.DOTALL)
     points = point_re.findall(answer)
     if not points:
-        # Попробуем по строкам через дефис/тире
         points = [line for line in answer.split("\n") if line.strip()]
-
     if not points:
         return answer
 
@@ -854,26 +855,22 @@ def _attach_images_to_answer(
             result_parts.append(point)
             continue
 
-        # Находим чанк с максимальным пересечением
-        best_idx = -1
+        # Ищем лучший рисунок для этого пункта
+        best_marker = None
+        best_url = None
         best_score = 0
-        for i, cb in enumerate(chunk_bags):
-            score = len(point_bag & cb)
+        for marker, preceding_bag, url in marker_entries:
+            if marker in used_markers:
+                continue
+            score = len(point_bag & preceding_bag)
             if score > best_score:
                 best_score = score
-                best_idx = i
+                best_marker = marker
+                best_url = url
 
-        attached: list[str] = []
-        if best_idx >= 0 and best_score >= 2:
-            for marker in chunk_images[best_idx]:
-                if marker not in used_markers:
-                    url = image_urls.get(marker)
-                    if url:
-                        attached.append(url)
-                    used_markers.add(marker)
-
-        if attached:
-            result_parts.append(point + "\n" + "\n".join(attached))
+        if best_marker and best_score >= 2:
+            used_markers.add(best_marker)
+            result_parts.append(f"{point}\n{best_url}")
         else:
             result_parts.append(point)
 
