@@ -888,16 +888,21 @@ def _attach_images_to_answer(
     Ответ следует порядку документа, картинки в чанках тоже идут по порядку —
     поэтому просто сопоставляем по порядковому номеру: 1-й пункт → 1-я картинка и т.д.
     """
-    img_marker_re = re.compile(r"\[Рисунок \d+: [^\]]+\]")
+    img_marker_re = re.compile(r"\[Рисунок (\d+): [^\]]+\]")
 
-    # Собираем URL картинок в порядке их появления в чанках
-    ordered_urls: list[str] = []
+    # Собираем картинки с номерами, сортируем по номеру Рисунка (порядок документа)
+    seen: set[str] = set()
+    entries: list[tuple[int, str]] = []  # (номер рисунка, url)
     for chunk_text in chunks:
         for match in img_marker_re.finditer(chunk_text):
             marker = match.group(0)
+            num = int(match.group(1))
             url = image_urls.get(marker)
-            if url and url not in ordered_urls:
-                ordered_urls.append(url)
+            if url and marker not in seen:
+                seen.add(marker)
+                entries.append((num, url))
+    entries.sort(key=lambda e: e[0])
+    ordered_urls = [url for _, url in entries]
 
     if not ordered_urls:
         return answer
