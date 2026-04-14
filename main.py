@@ -883,19 +883,44 @@ def _attach_images_to_answer(
 ) -> str:
     """
     Привязка иллюстраций к пунктам ответа последовательно.
-    Берёт картинки только из основного документа (с наибольшим числом чанков),
-    сортирует по номеру Рисунка и привязывает по порядку к пунктам.
+    Для каждой картинки проверяет, что окружающий текст в чанке
+    пересекается с текстом ответа (минимум 2 значимых слова).
+    Это отсеивает картинки из нерелевантных секций документа.
     """
     img_marker_re = re.compile(r"\[Рисунок (\d+): [^\]]+\]")
+    _stop = {
+        "и", "в", "на", "по", "с", "к", "из", "за", "от", "до", "для",
+        "не", "что", "как", "это", "или", "а", "но", "то", "же", "ли",
+        "бы", "его", "её", "их", "все", "при", "так", "уже", "нет",
+        "да", "если", "он", "она", "они", "мы", "вы", "нужно", "можно",
+        "будет", "быть", "был", "была", "были", "где", "когда", "чтобы",
+        "только", "также", "после", "через", "между", "перед", "без",
+    }
 
-    # Собираем картинки из найденных чанков в порядке появления
+    def _significant_words(text: str) -> set[str]:
+        return {
+            w for w in re.findall(r"[а-яёa-z]{3,}", text.lower())
+            if w not in _stop
+        }
+
+    answer_words = _significant_words(answer)
+
+    # Собираем картинки, фильтруя по релевантности окружающего текста
     seen: set[str] = set()
     ordered_urls: list[str] = []
     for chunk_text in chunks:
         for match in img_marker_re.finditer(chunk_text):
             marker = match.group(0)
             url = image_urls.get(marker)
-            if url and marker not in seen:
+            if not url or marker in seen:
+                continue
+            # Берём ~150 символов вокруг маркера как контекст картинки
+            start = max(0, match.start() - 150)
+            end = min(len(chunk_text), match.end() + 150)
+            vicinity = chunk_text[start:end]
+            vicinity_words = _significant_words(vicinity)
+            # Картинка релевантна, если хотя бы 2 значимых слова совпадают
+            if len(answer_words & vicinity_words) >= 2:
                 seen.add(marker)
                 ordered_urls.append(url)
 
