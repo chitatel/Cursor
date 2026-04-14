@@ -901,46 +901,24 @@ def _attach_images_to_answer(
     image_urls: dict[str, str],
 ) -> str:
     """
-    Привязка иллюстраций к пунктам ответа.
-    Для каждого пункта ищет лучшую картинку по пересечению слов
-    между текстом пункта и текстом ПЕРЕД маркером картинки в чанке.
-    Картинка без совпадений не привязывается.
+    Привязка иллюстраций к пунктам ответа последовательно.
+    Берёт картинки только из TOP-3 чанков (самые релевантные),
+    в порядке появления, и раздаёт по пунктам ответа по порядку.
     """
     img_marker_re = re.compile(r"\[Рисунок (\d+): [^\]]+\]")
-    _stop = {
-        "и", "в", "на", "по", "с", "к", "из", "за", "от", "до", "для",
-        "не", "что", "как", "это", "или", "а", "но", "то", "же", "ли",
-        "бы", "его", "её", "их", "все", "при", "так", "уже", "нет",
-        "да", "если", "он", "она", "они", "мы", "вы", "нужно", "можно",
-        "будет", "быть", "был", "была", "были", "где", "когда", "чтобы",
-        "только", "также", "после", "через", "между", "перед", "без",
-        "свой", "своей", "своего", "этот", "эта", "этого", "этой",
-        "весь", "вся", "всё", "один", "два", "три", "который", "которая",
-    }
 
-    def _significant_words(text: str) -> set[str]:
-        return {
-            w for w in re.findall(r"[а-яёa-z]{3,}", text.lower())
-            if w not in _stop
-        }
-
-    # Собираем картинки только из TOP-3 чанков (самых релевантных),
-    # чтобы не тянуть картинки из менее релевантных секций документа
-    candidates: list[tuple[str, set[str]]] = []  # (url, words_before)
+    # Собираем картинки только из TOP-3 чанков в порядке появления
     seen: set[str] = set()
+    ordered_urls: list[str] = []
     for chunk_text in chunks[:3]:
         for match in img_marker_re.finditer(chunk_text):
             marker = match.group(0)
             url = image_urls.get(marker)
-            if not url or marker in seen:
-                continue
-            seen.add(marker)
-            # Текст перед картинкой (до 200 символов) — он описывает что на картинке
-            before_start = max(0, match.start() - 200)
-            text_before = chunk_text[before_start:match.start()]
-            candidates.append((url, _significant_words(text_before)))
+            if url and marker not in seen:
+                seen.add(marker)
+                ordered_urls.append(url)
 
-    if not candidates:
+    if not ordered_urls:
         return answer
 
     # Разбиваем ответ на пункты
@@ -951,24 +929,10 @@ def _attach_images_to_answer(
     if not points:
         return answer
 
-    # Для каждого пункта находим лучшую картинку по числу совпавших слов
-    used_images: set[int] = set()
     result_parts: list[str] = []
-    for point in points:
-        point_words = _significant_words(point)
-        best_idx = -1
-        best_score = 0
-        for idx, (url, img_words) in enumerate(candidates):
-            if idx in used_images:
-                continue
-            score = len(point_words & img_words)
-            if score > best_score:
-                best_score = score
-                best_idx = idx
-        # Требуем минимум 2 совпавших слова для привязки
-        if best_idx >= 0 and best_score >= 2:
-            used_images.add(best_idx)
-            result_parts.append(f"{point}\n{candidates[best_idx][0]}")
+    for i, point in enumerate(points):
+        if i < len(ordered_urls):
+            result_parts.append(f"{point}\n{ordered_urls[i]}")
         else:
             result_parts.append(point)
 
@@ -1530,7 +1494,9 @@ async def ask(req: AskRequest, request: Request):
         f"[CHUNK {i} | {m['filename']}]\n{d}"
         for i, (d, m) in enumerate(zip(all_docs, all_metas))
     )
-    sources = list(dict.fromkeys(m["filename"] for m in all_metas))
+    # Источники — только из TOP-3 найденных чанков (самые релевантные),
+    # чтобы не показывать документы, попавшие случайно в хвост результатов
+    sources = list(dict.fromkeys(m["filename"] for m in metas[:3]))
 
     try:
         answer = await _chat(
