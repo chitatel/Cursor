@@ -807,11 +807,16 @@ def _is_faithful(answer: str, context: str) -> bool:
 
 # ── Форматирование ответа в HTML ─────────────────────────────────────────────
 
-def _answer_to_html(answer: str, image_urls: dict[str, str]) -> str:
+def _answer_to_html(
+    answer: str,
+    image_urls: dict[str, str],
+    download_urls: dict[str, str] | None = None,
+) -> str:
     """
     Конвертирует текстовый ответ в HTML для отображения в 1С.
     - Нумерованные пункты → <ol><li>
-    - URL картинок → блок иллюстраций внизу
+    - URL картинок → inline <img>
+    - Ссылки на документы-источники внизу (без дублей)
     - Остальной текст → <p>
     """
     from html import escape
@@ -859,6 +864,18 @@ def _answer_to_html(answer: str, image_urls: dict[str, str]) -> str:
     if in_list:
         html_parts.append("</li></ol>")
 
+    # Блок ссылок на документы-источники
+    if download_urls:
+        html_parts.append('<hr style="margin-top:16px; border:none; border-top:1px solid #ddd;">')
+        html_parts.append('<p style="margin-top:12px; font-size:13px; color:#666;">Источники:</p>')
+        html_parts.append('<ul style="padding-left:20px; font-size:13px;">')
+        for filename, url in download_urls.items():
+            display_name = escape(filename)
+            html_parts.append(
+                f'<li><a href="{escape(url)}" style="color:#1a73e8;">{display_name}</a></li>'
+            )
+        html_parts.append("</ul>")
+
     body = "\n".join(html_parts)
     return (
         '<!DOCTYPE html><html><head><meta charset="utf-8">'
@@ -868,6 +885,8 @@ def _answer_to_html(answer: str, image_urls: dict[str, str]) -> str:
         "li { margin-bottom: 10px; }"
         "p { margin: 8px 0; }"
         "img { display: block; }"
+        "a { text-decoration: none; }"
+        "a:hover { text-decoration: underline; }"
         "</style>"
         f"</head><body>{body}</body></html>"
     )
@@ -1541,6 +1560,8 @@ async def ask(req: AskRequest, request: Request):
 
     # Убираем блок рассуждений <think>...</think> (deepseek-r1 и подобные)
     answer = re.sub(r"<think>.*?</think>", "", answer, flags=re.DOTALL).strip()
+    # Убираем маркеры чанков [CHUNK N] / (CHUNK N), которые LLM может скопировать из контекста
+    answer = re.sub(r"\s*[\(\[]\s*CHUNK\s*\d+\s*[\)\]]", "", answer).strip()
 
     answer_clean = answer.strip()
     for quote in ['"', "'", "«", "»"]:
@@ -1574,7 +1595,7 @@ async def ask(req: AskRequest, request: Request):
     if image_urls and answer != _not_found:
         answer = _attach_images_to_answer(answer, docs, metas, image_urls)
 
-    answer_html = _answer_to_html(answer, image_urls)
+    answer_html = _answer_to_html(answer, image_urls, download_urls)
 
     return AskResponse(
         answer=answer,
