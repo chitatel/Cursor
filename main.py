@@ -882,10 +882,10 @@ def _attach_images_to_answer(
     image_urls: dict[str, str],
 ) -> str:
     """
-    Привязка иллюстраций к пунктам ответа последовательно.
-    Для каждой картинки проверяет, что окружающий текст в чанке
-    пересекается с текстом ответа (минимум 2 значимых слова).
-    Это отсеивает картинки из нерелевантных секций документа.
+    Привязка иллюстраций к пунктам ответа.
+    Для каждого пункта ищет лучшую картинку по пересечению слов
+    между текстом пункта и текстом ПЕРЕД маркером картинки в чанке.
+    Картинка без совпадений не привязывается.
     """
     img_marker_re = re.compile(r"\[Рисунок (\d+): [^\]]+\]")
     _stop = {
@@ -895,6 +895,8 @@ def _attach_images_to_answer(
         "да", "если", "он", "она", "они", "мы", "вы", "нужно", "можно",
         "будет", "быть", "был", "была", "были", "где", "когда", "чтобы",
         "только", "также", "после", "через", "между", "перед", "без",
+        "свой", "своей", "своего", "этот", "эта", "этого", "этой",
+        "весь", "вся", "всё", "один", "два", "три", "который", "которая",
     }
 
     def _significant_words(text: str) -> set[str]:
@@ -903,28 +905,23 @@ def _attach_images_to_answer(
             if w not in _stop
         }
 
-    answer_words = _significant_words(answer)
-
-    # Собираем картинки, фильтруя по релевантности окружающего текста
+    # Собираем картинки только из TOP-3 чанков (самых релевантных),
+    # чтобы не тянуть картинки из менее релевантных секций документа
+    candidates: list[tuple[str, set[str]]] = []  # (url, words_before)
     seen: set[str] = set()
-    ordered_urls: list[str] = []
-    for chunk_text in chunks:
+    for chunk_text in chunks[:3]:
         for match in img_marker_re.finditer(chunk_text):
             marker = match.group(0)
             url = image_urls.get(marker)
             if not url or marker in seen:
                 continue
-            # Берём ~150 символов вокруг маркера как контекст картинки
-            start = max(0, match.start() - 150)
-            end = min(len(chunk_text), match.end() + 150)
-            vicinity = chunk_text[start:end]
-            vicinity_words = _significant_words(vicinity)
-            # Картинка релевантна, если хотя бы 2 значимых слова совпадают
-            if len(answer_words & vicinity_words) >= 2:
-                seen.add(marker)
-                ordered_urls.append(url)
+            seen.add(marker)
+            # Текст перед картинкой (до 200 символов) — он описывает что на картинке
+            before_start = max(0, match.start() - 200)
+            text_before = chunk_text[before_start:match.start()]
+            candidates.append((url, _significant_words(text_before)))
 
-    if not ordered_urls:
+    if not candidates:
         return answer
 
     # Разбиваем ответ на пункты
@@ -935,10 +932,24 @@ def _attach_images_to_answer(
     if not points:
         return answer
 
+    # Для каждого пункта находим лучшую картинку по числу совпавших слов
+    used_images: set[int] = set()
     result_parts: list[str] = []
-    for i, point in enumerate(points):
-        if i < len(ordered_urls):
-            result_parts.append(f"{point}\n{ordered_urls[i]}")
+    for point in points:
+        point_words = _significant_words(point)
+        best_idx = -1
+        best_score = 0
+        for idx, (url, img_words) in enumerate(candidates):
+            if idx in used_images:
+                continue
+            score = len(point_words & img_words)
+            if score > best_score:
+                best_score = score
+                best_idx = idx
+        # Требуем минимум 2 совпавших слова для привязки
+        if best_idx >= 0 and best_score >= 2:
+            used_images.add(best_idx)
+            result_parts.append(f"{point}\n{candidates[best_idx][0]}")
         else:
             result_parts.append(point)
 
