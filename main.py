@@ -1538,22 +1538,53 @@ async def ask(req: AskRequest, request: Request):
             log.warning("Faithfulness check failed — suppressing answer")
             answer = "Информация в документах не найдена."
 
-    # Определяем основной документ по пересечению слов ответа с чанками
-    def _word_set(text: str) -> set[str]:
-        return set(re.findall(r"[а-яёa-z]{3,}", text.lower()))
+    # Определяем основной документ (для картинок):
+    # 1) Совпадение корней слов вопроса с именем файла
+    # 2) Фоллбэк: документ, чьи чанки содержат больше УНИКАЛЬНЫХ слов из ответа
+    #    (слов, которых нет в чанках других документов)
+    def _roots(text: str) -> set[str]:
+        """Извлекает корни (первые 5 букв) значимых слов."""
+        return {w[:5] for w in re.findall(r"[а-яёa-z]{5,}", text.lower())}
 
-    answer_words = _word_set(answer)
-    _doc_scores: dict[str, int] = {}
-    for d, m in zip(docs, metas):
-        fn = m["filename"]
-        overlap = len(answer_words & _word_set(d))
-        _doc_scores[fn] = _doc_scores.get(fn, 0) + overlap
+    q_roots = _roots(req.question)
+    unique_fnames = list(dict.fromkeys(m["filename"] for m in metas))
+    _fname_scores: dict[str, int] = {}
+    for fn in unique_fnames:
+        fn_roots = _roots(fn.replace("_", " ").replace("-", " "))
+        _fname_scores[fn] = len(q_roots & fn_roots)
 
-    _primary_doc = max(_doc_scores, key=_doc_scores.get) if _doc_scores else metas[0]["filename"]
-    log.info("Doc scores: %s", _doc_scores)
+    best_fname_score = max(_fname_scores.values()) if _fname_scores else 0
+    if best_fname_score > 0:
+        _primary_doc = max(_fname_scores, key=_fname_scores.get)
+    else:
+        # Фоллбэк: для каждого документа считаем слова из ответа,
+        # которые есть ТОЛЬКО в его чанках (уникальные для документа)
+        _doc_words: dict[str, set[str]] = {}
+        for d, m in zip(docs, metas):
+            fn = m["filename"]
+            words = set(re.findall(r"[а-яёa-z]{4,}", d.lower()))
+            _doc_words.setdefault(fn, set()).update(words)
+
+        answer_w = set(re.findall(r"[а-яёa-z]{4,}", answer.lower()))
+        _doc_unique_scores: dict[str, int] = {}
+        for fn in unique_fnames:
+            # Слова этого документа, которых нет в других документах
+            other_words = set()
+            for fn2, w2 in _doc_words.items():
+                if fn2 != fn:
+                    other_words |= w2
+            unique_words = _doc_words.get(fn, set()) - other_words
+            _doc_unique_scores[fn] = len(answer_w & unique_words)
+
+        _primary_doc = max(_doc_unique_scores, key=_doc_unique_scores.get) \
+            if _doc_unique_scores and max(_doc_unique_scores.values()) > 0 \
+            else metas[0]["filename"]
+
+    log.info("Filename scores: %s", _fname_scores)
     log.info("Primary doc: %s", _primary_doc)
 
-    sources = [_primary_doc]
+    # Источники: все уникальные документы, основной первым
+    sources = [_primary_doc] + [fn for fn in unique_fnames if fn != _primary_doc]
     base = _public_base_url(request)
     download_urls = {s: f"{base}/documents/{s}/download" for s in sources}
 
