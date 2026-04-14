@@ -1494,9 +1494,12 @@ async def ask(req: AskRequest, request: Request):
         f"[CHUNK {i} | {m['filename']}]\n{d}"
         for i, (d, m) in enumerate(zip(all_docs, all_metas))
     )
-    # Источники — только из TOP-3 найденных чанков (самые релевантные),
-    # чтобы не показывать документы, попавшие случайно в хвост результатов
-    sources = list(dict.fromkeys(m["filename"] for m in metas[:3]))
+    # Определяем основной документ — тот, из которого больше всего чанков в результатах
+    from collections import Counter
+    _fname_counts = Counter(m["filename"] for m in metas)
+    _primary_doc = _fname_counts.most_common(1)[0][0]
+    # Источник — только основной документ
+    sources = [_primary_doc]
 
     try:
         answer = await _chat(
@@ -1556,10 +1559,11 @@ async def ask(req: AskRequest, request: Request):
                 )
 
     # Привязываем иллюстрации к пунктам ответа
-    # Используем оригинальные docs (не расширенные), чтобы картинки брались
-    # только из реально найденных чанков, а не из соседних секций
+    # Берём только чанки основного документа — без примесей из других инструкций
+    _primary_docs = [d for d, m in zip(docs, metas) if m["filename"] == _primary_doc]
+    _primary_metas = [m for m in metas if m["filename"] == _primary_doc]
     if image_urls and answer != _not_found:
-        answer = _attach_images_to_answer(answer, docs, metas, image_urls)
+        answer = _attach_images_to_answer(answer, _primary_docs, _primary_metas, image_urls)
 
     answer_html = _answer_to_html(answer, image_urls, download_urls)
 
