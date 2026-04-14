@@ -910,14 +910,17 @@ def _attach_images_to_answer(
     # Собираем картинки только из TOP-3 чанков в порядке появления
     seen: set[str] = set()
     ordered_urls: list[str] = []
-    for chunk_text in chunks[:3]:
+    log.info("_attach_images: chunks=%d, image_urls=%d", len(chunks), len(image_urls))
+    for ci, chunk_text in enumerate(chunks[:3]):
         for match in img_marker_re.finditer(chunk_text):
             marker = match.group(0)
             url = image_urls.get(marker)
+            log.info("  chunk[%d] marker=%s url=%s", ci, marker, bool(url))
             if url and marker not in seen:
                 seen.add(marker)
                 ordered_urls.append(url)
 
+    log.info("_attach_images: ordered_urls=%d", len(ordered_urls))
     if not ordered_urls:
         return answer
 
@@ -1498,6 +1501,8 @@ async def ask(req: AskRequest, request: Request):
     from collections import Counter
     _fname_counts = Counter(m["filename"] for m in metas)
     _primary_doc = _fname_counts.most_common(1)[0][0]
+    log.info("Chunk sources: %s", dict(_fname_counts))
+    log.info("Primary doc: %s", _primary_doc)
     # Источник — только основной документ
     sources = [_primary_doc]
 
