@@ -903,7 +903,7 @@ def _attach_images_to_answer(
         for w in ws:
             doc_freq[w] += 1
     n_chunks = max(len(chunks), 1)
-    _stop = _base_stop | {w for w, cnt in doc_freq.items() if cnt / n_chunks > 0.4}
+    _stop = _base_stop | {w for w, cnt in doc_freq.items() if cnt / n_chunks > 0.75}
 
     def bag(text: str) -> set[str]:
         cleaned = img_marker_re.sub("", text)
