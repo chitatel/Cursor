@@ -1497,13 +1497,6 @@ async def ask(req: AskRequest, request: Request):
         f"[CHUNK {i} | {m['filename']}]\n{d}"
         for i, (d, m) in enumerate(zip(all_docs, all_metas))
     )
-    # Основной документ — из первого (самого релевантного) чанка
-    _primary_doc = metas[0]["filename"]
-    log.info("Chunk sources: %s", [m["filename"] for m in metas])
-    log.info("Primary doc: %s", _primary_doc)
-    # Источники — только основной документ
-    sources = [_primary_doc]
-
     try:
         answer = await _chat(
             [
@@ -1545,6 +1538,22 @@ async def ask(req: AskRequest, request: Request):
             log.warning("Faithfulness check failed — suppressing answer")
             answer = "Информация в документах не найдена."
 
+    # Определяем основной документ по пересечению слов ответа с чанками
+    def _word_set(text: str) -> set[str]:
+        return set(re.findall(r"[а-яёa-z]{3,}", text.lower()))
+
+    answer_words = _word_set(answer)
+    _doc_scores: dict[str, int] = {}
+    for d, m in zip(docs, metas):
+        fn = m["filename"]
+        overlap = len(answer_words & _word_set(d))
+        _doc_scores[fn] = _doc_scores.get(fn, 0) + overlap
+
+    _primary_doc = max(_doc_scores, key=_doc_scores.get) if _doc_scores else metas[0]["filename"]
+    log.info("Doc scores: %s", _doc_scores)
+    log.info("Primary doc: %s", _primary_doc)
+
+    sources = [_primary_doc]
     base = _public_base_url(request)
     download_urls = {s: f"{base}/documents/{s}/download" for s in sources}
 
