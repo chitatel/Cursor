@@ -811,7 +811,7 @@ def _answer_to_html(answer: str, image_urls: dict[str, str]) -> str:
     """
     Конвертирует текстовый ответ в HTML для отображения в 1С.
     - Нумерованные пункты → <ol><li>
-    - URL картинок → <img> теги
+    - URL картинок → блок иллюстраций внизу
     - Остальной текст → <p>
     """
     from html import escape
@@ -821,7 +821,6 @@ def _answer_to_html(answer: str, image_urls: dict[str, str]) -> str:
     in_list = False
     numbered_re = re.compile(r"^(\d+)[\.\)]\s+(.*)")
 
-    # Собираем обратный маппинг URL → marker для image_urls
     url_set = set(image_urls.values()) if image_urls else set()
 
     for line in lines:
@@ -829,10 +828,9 @@ def _answer_to_html(answer: str, image_urls: dict[str, str]) -> str:
         if not stripped:
             continue
 
-        # Строка — это URL картинки
+        # URL картинки — вставляем inline
         if stripped in url_set:
             if in_list:
-                # Вставляем картинку внутрь последнего <li>
                 html_parts.append(
                     f'<br><img src="{escape(stripped)}" '
                     f'style="max-width:100%; margin-top:8px; border:1px solid #ccc; border-radius:4px;">'
@@ -885,24 +883,21 @@ def _attach_images_to_answer(
 ) -> str:
     """
     Привязка иллюстраций к пунктам ответа последовательно.
-    Ответ следует порядку документа, картинки в чанках тоже идут по порядку —
-    поэтому просто сопоставляем по порядковому номеру: 1-й пункт → 1-я картинка и т.д.
+    Берёт картинки только из основного документа (с наибольшим числом чанков),
+    сортирует по номеру Рисунка и привязывает по порядку к пунктам.
     """
     img_marker_re = re.compile(r"\[Рисунок (\d+): [^\]]+\]")
 
-    # Собираем картинки с номерами, сортируем по номеру Рисунка (порядок документа)
+    # Собираем картинки из найденных чанков в порядке появления
     seen: set[str] = set()
-    entries: list[tuple[int, str]] = []  # (номер рисунка, url)
+    ordered_urls: list[str] = []
     for chunk_text in chunks:
         for match in img_marker_re.finditer(chunk_text):
             marker = match.group(0)
-            num = int(match.group(1))
             url = image_urls.get(marker)
             if url and marker not in seen:
                 seen.add(marker)
-                entries.append((num, url))
-    entries.sort(key=lambda e: e[0])
-    ordered_urls = [url for _, url in entries]
+                ordered_urls.append(url)
 
     if not ordered_urls:
         return answer
@@ -1537,9 +1532,11 @@ async def ask(req: AskRequest, request: Request):
                     f"{base}/documents/{meta['filename']}/images/{img_name}"
                 )
 
-    # Привязываем иллюстрации к пунктам ответа по содержимому чанков
+    # Привязываем иллюстрации к пунктам ответа
+    # Используем оригинальные docs (не расширенные), чтобы картинки брались
+    # только из реально найденных чанков, а не из соседних секций
     if image_urls and answer != _not_found:
-        answer = _attach_images_to_answer(answer, all_docs, all_metas, image_urls)
+        answer = _attach_images_to_answer(answer, docs, metas, image_urls)
 
     answer_html = _answer_to_html(answer, image_urls)
 
