@@ -969,8 +969,8 @@ def _attach_images_to_answer(
                 best_marker = marker
                 best_url = url
 
-        # Порог: минимум 30% совпадения И минимум 3 значимых совпавших слова
-        if best_marker and best_ratio >= 0.3 and best_overlap >= 3:
+        # Порог: минимум 20% совпадения И минимум 2 значимых совпавших слова
+        if best_marker and best_ratio >= 0.2 and best_overlap >= 2:
             used_markers.add(best_marker)
             result_parts.append(f"{point}\n{best_url}")
         else:
@@ -1131,7 +1131,7 @@ def _detect_chunk_profile(texts: list[str]) -> tuple[str, int, int]:
     heading_ratio = heading_like / total_lines
 
     if short_ratio > 0.45 or numbered_ratio > 0.15 or heading_ratio > 0.20:
-        return ("cheatsheet", 350, 50)
+        return ("cheatsheet", 200, 30)
     return ("manual", 800, 120)
 
 
