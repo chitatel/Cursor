@@ -884,54 +884,22 @@ def _attach_images_to_answer(
     image_urls: dict[str, str],
 ) -> str:
     """
-    Для каждого рисунка берём текст непосредственно перед его маркером в чанке.
-    Затем для каждого пункта ответа ищем рисунок, чей предшествующий текст
-    лучше всего совпадает с пунктом.  Так каждый рисунок привязывается
-    к конкретному шагу, а не ко всему чанку.
+    Привязка иллюстраций к пунктам ответа последовательно.
+    Ответ следует порядку документа, картинки в чанках тоже идут по порядку —
+    поэтому просто сопоставляем по порядковому номеру: 1-й пункт → 1-я картинка и т.д.
     """
     img_marker_re = re.compile(r"\[Рисунок \d+: [^\]]+\]")
 
-    # Динамические стоп-слова: слова, встречающиеся в >40% чанков — слишком общие
-    from collections import Counter
-    _base_stop = {"также", "далее", "если", "этого", "того", "может", "будет", "было", "быть", "этом"}
-    chunk_word_sets = []
-    for ct in chunks:
-        cleaned = img_marker_re.sub("", ct)
-        chunk_word_sets.append(set(re.findall(r"[А-Яа-яЁёA-Za-z0-9-]{4,}", cleaned.lower())))
-    doc_freq: Counter = Counter()
-    for ws in chunk_word_sets:
-        for w in ws:
-            doc_freq[w] += 1
-    n_chunks = max(len(chunks), 1)
-    _stop = _base_stop | {w for w, cnt in doc_freq.items() if cnt / n_chunks > 0.75}
-
-    def bag(text: str) -> set[str]:
-        cleaned = img_marker_re.sub("", text)
-        words = set(re.findall(r"[А-Яа-яЁёA-Za-z0-9-]{4,}", cleaned.lower()))
-        return words - _stop
-
-    # Для каждого маркера берём 1-2 предложения непосредственно перед ним
-    # (marker, preceding_bag, url)
-    marker_entries: list[tuple[str, set[str], str]] = []
+    # Собираем URL картинок в порядке их появления в чанках
+    ordered_urls: list[str] = []
     for chunk_text in chunks:
-        markers_in_chunk = list(img_marker_re.finditer(chunk_text))
-        if not markers_in_chunk:
-            continue
-        for i, match in enumerate(markers_in_chunk):
+        for match in img_marker_re.finditer(chunk_text):
             marker = match.group(0)
             url = image_urls.get(marker)
-            if not url:
-                continue
-            # Берём текст между предыдущим маркером и текущим
-            start = markers_in_chunk[i - 1].end() if i > 0 else 0
-            preceding = chunk_text[start:match.start()].strip()
-            # Берём последние 2 предложения — они ближе всего к рисунку
-            sentences = re.split(r"[.!?\n]+", preceding)
-            sentences = [s.strip() for s in sentences if s.strip()]
-            nearby = " ".join(sentences[-2:]) if sentences else ""
-            marker_entries.append((marker, bag(nearby), url))
+            if url and url not in ordered_urls:
+                ordered_urls.append(url)
 
-    if not marker_entries:
+    if not ordered_urls:
         return answer
 
     # Разбиваем ответ на пункты
@@ -942,37 +910,10 @@ def _attach_images_to_answer(
     if not points:
         return answer
 
-    used_markers: set[str] = set()
     result_parts: list[str] = []
-
-    for point in points:
-        point_bag = bag(point)
-        if not point_bag:
-            result_parts.append(point)
-            continue
-
-        # Ищем лучший рисунок для этого пункта
-        best_marker = None
-        best_url = None
-        best_ratio = 0.0
-        best_overlap = 0
-        for marker, preceding_bag, url in marker_entries:
-            if marker in used_markers:
-                continue
-            if not preceding_bag:
-                continue
-            overlap = len(point_bag & preceding_bag)
-            ratio = overlap / min(len(point_bag), len(preceding_bag))
-            if ratio > best_ratio:
-                best_ratio = ratio
-                best_overlap = overlap
-                best_marker = marker
-                best_url = url
-
-        # Порог: минимум 20% совпадения И минимум 2 значимых совпавших слова
-        if best_marker and best_ratio >= 0.2 and best_overlap >= 2:
-            used_markers.add(best_marker)
-            result_parts.append(f"{point}\n{best_url}")
+    for i, point in enumerate(points):
+        if i < len(ordered_urls):
+            result_parts.append(f"{point}\n{ordered_urls[i]}")
         else:
             result_parts.append(point)
 
