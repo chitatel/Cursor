@@ -884,38 +884,24 @@ def _attach_images_to_answer(
     image_urls: dict[str, str],
 ) -> str:
     """
-    Для каждого рисунка берём текст непосредственно перед его маркером в чанке.
-    Затем для каждого пункта ответа ищем рисунок, чей предшествующий текст
-    лучше всего совпадает с пунктом.  Так каждый рисунок привязывается
-    к конкретному шагу, а не ко всему чанку.
+    Строгая привязка: собираем картинки только из переданных чанков
+    в порядке появления и раздаём по пунктам ответа последовательно.
     """
-    img_marker_re = re.compile(r"\[Рисунок \d+: [^\]]+\]")
+    img_marker_re = re.compile(r"\[Рисунок (\d+): [^\]]+\]")
 
-    def bag(text: str) -> set[str]:
-        cleaned = img_marker_re.sub("", text)
-        return set(re.findall(r"[А-Яа-яЁёA-Za-z0-9-]{4,}", cleaned.lower()))
-
-    # Для каждого маркера собираем «контекст» — текст перед ним в чанке
-    # (marker, preceding_bag, url)
-    marker_entries: list[tuple[str, set[str], str]] = []
+    seen: set[str] = set()
+    ordered_urls: list[str] = []
     for chunk_text in chunks:
-        markers_in_chunk = list(img_marker_re.finditer(chunk_text))
-        if not markers_in_chunk:
-            continue
-        for i, match in enumerate(markers_in_chunk):
+        for match in img_marker_re.finditer(chunk_text):
             marker = match.group(0)
             url = image_urls.get(marker)
-            if not url:
-                continue
-            # Текст от предыдущего маркера (или начала чанка) до текущего
-            start = markers_in_chunk[i - 1].end() if i > 0 else 0
-            preceding = chunk_text[start:match.start()]
-            marker_entries.append((marker, bag(preceding), url))
+            if url and marker not in seen:
+                seen.add(marker)
+                ordered_urls.append(url)
 
-    if not marker_entries:
+    if not ordered_urls:
         return answer
 
-    # Разбиваем ответ на пункты
     point_re = re.compile(r"(?:^|\n)(\d+[\.\)]\s+.*?)(?=\n\d+[\.\)]\s+|\Z)", re.DOTALL)
     points = point_re.findall(answer)
     if not points:
@@ -923,31 +909,10 @@ def _attach_images_to_answer(
     if not points:
         return answer
 
-    used_markers: set[str] = set()
     result_parts: list[str] = []
-
-    for point in points:
-        point_bag = bag(point)
-        if not point_bag:
-            result_parts.append(point)
-            continue
-
-        # Ищем лучший рисунок для этого пункта
-        best_marker = None
-        best_url = None
-        best_score = 0
-        for marker, preceding_bag, url in marker_entries:
-            if marker in used_markers:
-                continue
-            score = len(point_bag & preceding_bag)
-            if score > best_score:
-                best_score = score
-                best_marker = marker
-                best_url = url
-
-        if best_marker and best_score >= 2:
-            used_markers.add(best_marker)
-            result_parts.append(f"{point}\n{best_url}")
+    for i, point in enumerate(points):
+        if i < len(ordered_urls):
+            result_parts.append(f"{point}\n{ordered_urls[i]}")
         else:
             result_parts.append(point)
 
@@ -1546,6 +1511,8 @@ async def ask(req: AskRequest, request: Request):
 
     # Убираем блок рассуждений <think>...</think> (deepseek-r1 и подобные)
     answer = re.sub(r"<think>.*?</think>", "", answer, flags=re.DOTALL).strip()
+    # Убираем маркеры чанков [CHUNK N] / (CHUNK N), которые LLM может скопировать из контекста
+    answer = re.sub(r"\s*[\(\[]\s*CHUNK\s*\d+\s*[\)\]]", "", answer).strip()
 
     answer_clean = answer.strip()
     for quote in ['"', "'", "«", "»"]:
@@ -1560,12 +1527,12 @@ async def ask(req: AskRequest, request: Request):
     base = _public_base_url(request)
     download_urls = {s: f"{base}/documents/{s}/download" for s in sources}
 
-    # Собираем ссылки на изображения из маркеров [Рисунок N: img_name] в чанках
+    # Собираем ссылки на изображения ТОЛЬКО из оригинальных чанков поиска (docs),
+    # не из расширенных (all_docs) — чтобы не тянуть картинки из соседних секций
     image_urls: dict[str, str] = {}
     img_marker_re = re.compile(r"\[Рисунок (\d+): ([^\]]+)\]")
-    for doc_text, meta in zip(all_docs, all_metas):
+    for doc_text, meta in zip(docs, metas):
         for match in img_marker_re.finditer(doc_text):
-            img_num = int(match.group(1))
             img_name = match.group(2)
             marker = match.group(0)
             if marker not in image_urls:
@@ -1573,9 +1540,9 @@ async def ask(req: AskRequest, request: Request):
                     f"{base}/documents/{meta['filename']}/images/{img_name}"
                 )
 
-    # Привязываем иллюстрации к пунктам ответа по содержимому чанков
+    # Привязываем иллюстрации к пунктам ответа — строго из найденных чанков
     if image_urls and answer != _not_found:
-        answer = _attach_images_to_answer(answer, all_docs, all_metas, image_urls)
+        answer = _attach_images_to_answer(answer, docs, metas, image_urls)
 
     answer_html = _answer_to_html(answer, image_urls)
 
