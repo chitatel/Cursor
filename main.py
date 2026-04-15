@@ -807,11 +807,16 @@ def _is_faithful(answer: str, context: str) -> bool:
 
 # ── Форматирование ответа в HTML ─────────────────────────────────────────────
 
-def _answer_to_html(answer: str, image_urls: dict[str, str]) -> str:
+def _answer_to_html(
+    answer: str,
+    image_urls: dict[str, str],
+    download_urls: dict[str, str] | None = None,
+) -> str:
     """
     Конвертирует текстовый ответ в HTML для отображения в 1С.
     - Нумерованные пункты → <ol><li>
     - URL картинок → <img> теги
+    - Ссылки на документы-источники внизу
     - Остальной текст → <p>
     """
     from html import escape
@@ -821,7 +826,6 @@ def _answer_to_html(answer: str, image_urls: dict[str, str]) -> str:
     in_list = False
     numbered_re = re.compile(r"^(\d+)[\.\)]\s+(.*)")
 
-    # Собираем обратный маппинг URL → marker для image_urls
     url_set = set(image_urls.values()) if image_urls else set()
 
     for line in lines:
@@ -832,7 +836,6 @@ def _answer_to_html(answer: str, image_urls: dict[str, str]) -> str:
         # Строка — это URL картинки
         if stripped in url_set:
             if in_list:
-                # Вставляем картинку внутрь последнего <li>
                 html_parts.append(
                     f'<br><img src="{escape(stripped)}" '
                     f'style="max-width:100%; margin-top:8px; border:1px solid #ccc; border-radius:4px;">'
@@ -861,6 +864,18 @@ def _answer_to_html(answer: str, image_urls: dict[str, str]) -> str:
     if in_list:
         html_parts.append("</li></ol>")
 
+    # Блок ссылок на документы-источники
+    if download_urls:
+        html_parts.append('<hr style="margin-top:16px; border:none; border-top:1px solid #ddd;">')
+        html_parts.append('<p style="margin-top:12px; font-size:13px; color:#666;">Источники:</p>')
+        html_parts.append('<ul style="padding-left:20px; font-size:13px;">')
+        for filename, url in download_urls.items():
+            html_parts.append(
+                f'<li><a href="{escape(url)}" style="color:#1a73e8; text-decoration:none;">'
+                f'{escape(filename)}</a></li>'
+            )
+        html_parts.append("</ul>")
+
     body = "\n".join(html_parts)
     return (
         '<!DOCTYPE html><html><head><meta charset="utf-8">'
@@ -870,6 +885,7 @@ def _answer_to_html(answer: str, image_urls: dict[str, str]) -> str:
         "li { margin-bottom: 10px; }"
         "p { margin: 8px 0; }"
         "img { display: block; }"
+        "a:hover { text-decoration: underline !important; }"
         "</style>"
         f"</head><body>{body}</body></html>"
     )
@@ -1474,7 +1490,7 @@ async def ask(req: AskRequest, request: Request):
         f"[CHUNK {i} | {m['filename']}]\n{d}"
         for i, (d, m) in enumerate(zip(all_docs, all_metas))
     )
-    sources = list(dict.fromkeys(m["filename"] for m in all_metas))
+    _all_sources = list(dict.fromkeys(m["filename"] for m in all_metas))
 
     try:
         answer = await _chat(
@@ -1525,24 +1541,50 @@ async def ask(req: AskRequest, request: Request):
             answer = "Информация в документах не найдена."
 
     base = _public_base_url(request)
-    download_urls = {s: f"{base}/documents/{s}/download" for s in sources}
 
-    # Собираем ссылки на изображения СТРОГО из одного документа:
-    # находим первый чанк с картинками (самый релевантный) и берём
-    # картинки только из чанков с тем же именем файла
+    # Собираем ссылки на изображения СТРОГО из одного документа.
+    # Приоритет: документ, чьё имя файла совпадает с темой вопроса.
+    # Фоллбэк: первый чанк с картинками (самый релевантный).
     image_urls: dict[str, str] = {}
     img_marker_re = re.compile(r"\[Рисунок (\d+): ([^\]]+)\]")
 
-    # Определяем файл-источник картинок — первый чанк, содержащий маркер
-    _img_source_file = None
-    for doc_text, meta in zip(docs, metas):
-        if img_marker_re.search(doc_text):
-            _img_source_file = meta["filename"]
-            break
+    # Корни слов вопроса (первые 5 букв слов длиной ≥5)
+    _q_roots = {w[:5] for w in re.findall(r"[а-яёa-z]{5,}", req.question.lower())}
 
+    # Ищем документ с картинками, чьё имя файла лучше всего совпадает с вопросом
+    _img_source_file = None
+    _best_fname_score = 0
+    _img_chunk_counts: dict[str, int] = {}  # файл → кол-во чанков с картинками
+    for doc_text, meta in zip(docs, metas):
+        fn = meta["filename"]
+        if img_marker_re.search(doc_text):
+            _img_chunk_counts[fn] = _img_chunk_counts.get(fn, 0) + 1
+            fn_roots = {w[:5] for w in re.findall(r"[а-яёa-z]{5,}",
+                        fn.replace("_", " ").replace("-", " ").lower())}
+            score = len(_q_roots & fn_roots)
+            if score > _best_fname_score:
+                _best_fname_score = score
+                _img_source_file = fn
+
+    # Фоллбэк: документ с наибольшим числом чанков с картинками
+    if not _img_source_file and _img_chunk_counts:
+        _img_source_file = max(_img_chunk_counts, key=_img_chunk_counts.get)
+
+    log.info("Image source: %s (fname_score=%d, img_chunks=%s)",
+             _img_source_file, _best_fname_score, _img_chunk_counts)
+
+    # Источники: самый релевантный документ (по совпадению имени с вопросом) первым
+    _fname_relevance: dict[str, int] = {}
+    for fn in _all_sources:
+        fn_roots = {w[:5] for w in re.findall(r"[а-яёa-z]{5,}",
+                    fn.replace("_", " ").replace("-", " ").lower())}
+        _fname_relevance[fn] = len(_q_roots & fn_roots)
+    sources = sorted(_all_sources, key=lambda fn: _fname_relevance.get(fn, 0), reverse=True)
+    download_urls = {s: f"{base}/documents/{s}/download" for s in sources}
+
+    _img_chunks: list[str] = []
+    _img_metas: list[dict] = []
     if _img_source_file:
-        _img_chunks = []
-        _img_metas = []
         for doc_text, meta in zip(docs, metas):
             if meta["filename"] == _img_source_file:
                 _img_chunks.append(doc_text)
@@ -1559,7 +1601,7 @@ async def ask(req: AskRequest, request: Request):
     if image_urls and answer != _not_found:
         answer = _attach_images_to_answer(answer, _img_chunks, _img_metas, image_urls)
 
-    answer_html = _answer_to_html(answer, image_urls)
+    answer_html = _answer_to_html(answer, image_urls, download_urls)
 
     return AskResponse(
         answer=answer,
