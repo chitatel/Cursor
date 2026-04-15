@@ -905,18 +905,24 @@ def _attach_images_to_answer(
     """
     img_marker_re = re.compile(r"\[Рисунок (\d+): [^\]]+\]")
 
+    # Собираем картинки из чанков с номером Рисунка
     seen: set[str] = set()
-    ordered_urls: list[str] = []
+    numbered_urls: list[tuple[int, str]] = []  # (номер_рисунка, url)
     for chunk_text in chunks:
         for match in img_marker_re.finditer(chunk_text):
             marker = match.group(0)
+            num = int(match.group(1))
             url = image_urls.get(marker)
             if url and marker not in seen:
                 seen.add(marker)
-                ordered_urls.append(url)
+                numbered_urls.append((num, url))
 
-    if not ordered_urls:
+    if not numbered_urls:
         return answer
+
+    # Сортируем по номеру Рисунка — они идут по порядку в документе
+    numbered_urls.sort(key=lambda x: x[0])
+    ordered_urls = [url for _, url in numbered_urls]
 
     point_re = re.compile(r"(?:^|\n)(\d+[\.\)]\s+.*?)(?=\n\d+[\.\)]\s+|\Z)", re.DOTALL)
     points = point_re.findall(answer)
