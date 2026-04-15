@@ -900,30 +900,36 @@ def _attach_images_to_answer(
     image_urls: dict[str, str],
 ) -> str:
     """
-    Строгая привязка: собираем картинки только из переданных чанков
-    в порядке появления и раздаём по пунктам ответа последовательно.
+    Для каждого рисунка берём текст непосредственно перед его маркером в чанке.
+    Затем для каждого пункта ответа ищем рисунок, чей предшествующий текст
+    лучше всего совпадает с пунктом.  Так каждый рисунок привязывается
+    к конкретному шагу, а не ко всему чанку.
     """
-    img_marker_re = re.compile(r"\[Рисунок (\d+): [^\]]+\]")
+    img_marker_re = re.compile(r"\[Рисунок \d+: [^\]]+\]")
 
-    # Собираем картинки из чанков с номером Рисунка
-    seen: set[str] = set()
-    numbered_urls: list[tuple[int, str]] = []  # (номер_рисунка, url)
+    def bag(text: str) -> set[str]:
+        cleaned = img_marker_re.sub("", text)
+        return set(re.findall(r"[А-Яа-яЁёA-Za-z0-9-]{4,}", cleaned.lower()))
+
+    # Для каждого маркера собираем «контекст» — текст перед ним в чанке
+    marker_entries: list[tuple[str, set[str], str]] = []
     for chunk_text in chunks:
-        for match in img_marker_re.finditer(chunk_text):
+        markers_in_chunk = list(img_marker_re.finditer(chunk_text))
+        if not markers_in_chunk:
+            continue
+        for i, match in enumerate(markers_in_chunk):
             marker = match.group(0)
-            num = int(match.group(1))
             url = image_urls.get(marker)
-            if url and marker not in seen:
-                seen.add(marker)
-                numbered_urls.append((num, url))
+            if not url:
+                continue
+            start = markers_in_chunk[i - 1].end() if i > 0 else 0
+            preceding = chunk_text[start:match.start()]
+            marker_entries.append((marker, bag(preceding), url))
 
-    if not numbered_urls:
+    if not marker_entries:
         return answer
 
-    # Сортируем по номеру Рисунка — они идут по порядку в документе
-    numbered_urls.sort(key=lambda x: x[0])
-    ordered_urls = [url for _, url in numbered_urls]
-
+    # Разбиваем ответ на пункты
     point_re = re.compile(r"(?:^|\n)(\d+[\.\)]\s+.*?)(?=\n\d+[\.\)]\s+|\Z)", re.DOTALL)
     points = point_re.findall(answer)
     if not points:
@@ -931,10 +937,30 @@ def _attach_images_to_answer(
     if not points:
         return answer
 
+    used_markers: set[str] = set()
     result_parts: list[str] = []
-    for i, point in enumerate(points):
-        if i < len(ordered_urls):
-            result_parts.append(f"{point}\n{ordered_urls[i]}")
+
+    for point in points:
+        point_bag = bag(point)
+        if not point_bag:
+            result_parts.append(point)
+            continue
+
+        best_marker = None
+        best_url = None
+        best_score = 0
+        for marker, preceding_bag, url in marker_entries:
+            if marker in used_markers:
+                continue
+            score = len(point_bag & preceding_bag)
+            if score > best_score:
+                best_score = score
+                best_marker = marker
+                best_url = url
+
+        if best_marker and best_score >= 2:
+            used_markers.add(best_marker)
+            result_parts.append(f"{point}\n{best_url}")
         else:
             result_parts.append(point)
 
@@ -1588,10 +1614,12 @@ async def ask(req: AskRequest, request: Request):
     sources = sorted(_all_sources, key=lambda fn: _fname_relevance.get(fn, 0), reverse=True)
     download_urls = {s: f"{base}/documents/{s}/download" for s in sources}
 
+    # Собираем чанки и картинки из расширенного контекста (all_docs),
+    # но только из файла-источника картинок
     _img_chunks: list[str] = []
     _img_metas: list[dict] = []
     if _img_source_file:
-        for doc_text, meta in zip(docs, metas):
+        for doc_text, meta in zip(all_docs, all_metas):
             if meta["filename"] == _img_source_file:
                 _img_chunks.append(doc_text)
                 _img_metas.append(meta)
