@@ -807,16 +807,11 @@ def _is_faithful(answer: str, context: str) -> bool:
 
 # ── Форматирование ответа в HTML ─────────────────────────────────────────────
 
-def _answer_to_html(
-    answer: str,
-    image_urls: dict[str, str],
-    download_urls: dict[str, str] | None = None,
-) -> str:
+def _answer_to_html(answer: str, image_urls: dict[str, str]) -> str:
     """
     Конвертирует текстовый ответ в HTML для отображения в 1С.
     - Нумерованные пункты → <ol><li>
-    - URL картинок → inline <img>
-    - Ссылки на документы-источники внизу (без дублей)
+    - URL картинок → <img> теги
     - Остальной текст → <p>
     """
     from html import escape
@@ -826,6 +821,7 @@ def _answer_to_html(
     in_list = False
     numbered_re = re.compile(r"^(\d+)[\.\)]\s+(.*)")
 
+    # Собираем обратный маппинг URL → marker для image_urls
     url_set = set(image_urls.values()) if image_urls else set()
 
     for line in lines:
@@ -833,9 +829,10 @@ def _answer_to_html(
         if not stripped:
             continue
 
-        # URL картинки — вставляем inline
+        # Строка — это URL картинки
         if stripped in url_set:
             if in_list:
+                # Вставляем картинку внутрь последнего <li>
                 html_parts.append(
                     f'<br><img src="{escape(stripped)}" '
                     f'style="max-width:100%; margin-top:8px; border:1px solid #ccc; border-radius:4px;">'
@@ -864,18 +861,6 @@ def _answer_to_html(
     if in_list:
         html_parts.append("</li></ol>")
 
-    # Блок ссылок на документы-источники
-    if download_urls:
-        html_parts.append('<hr style="margin-top:16px; border:none; border-top:1px solid #ddd;">')
-        html_parts.append('<p style="margin-top:12px; font-size:13px; color:#666;">Источники:</p>')
-        html_parts.append('<ul style="padding-left:20px; font-size:13px;">')
-        for filename, url in download_urls.items():
-            display_name = escape(filename)
-            html_parts.append(
-                f'<li><a href="{escape(url)}" style="color:#1a73e8;">{display_name}</a></li>'
-            )
-        html_parts.append("</ul>")
-
     body = "\n".join(html_parts)
     return (
         '<!DOCTYPE html><html><head><meta charset="utf-8">'
@@ -885,8 +870,6 @@ def _answer_to_html(
         "li { margin-bottom: 10px; }"
         "p { margin: 8px 0; }"
         "img { display: block; }"
-        "a { text-decoration: none; }"
-        "a:hover { text-decoration: underline; }"
         "</style>"
         f"</head><body>{body}</body></html>"
     )
@@ -901,27 +884,54 @@ def _attach_images_to_answer(
     image_urls: dict[str, str],
 ) -> str:
     """
-    Привязка иллюстраций к пунктам ответа последовательно.
-    Берёт картинки только из TOP-3 чанков (самые релевантные),
-    в порядке появления, и раздаёт по пунктам ответа по порядку.
+    Для каждого рисунка берём текст непосредственно перед его маркером в чанке.
+    Затем для каждого пункта ответа ищем рисунок, чей предшествующий текст
+    лучше всего совпадает с пунктом.  Так каждый рисунок привязывается
+    к конкретному шагу, а не ко всему чанку.
     """
-    img_marker_re = re.compile(r"\[Рисунок (\d+): [^\]]+\]")
+    img_marker_re = re.compile(r"\[Рисунок \d+: [^\]]+\]")
 
-    # Собираем картинки только из TOP-3 чанков в порядке появления
-    seen: set[str] = set()
-    ordered_urls: list[str] = []
-    log.info("_attach_images: chunks=%d, image_urls=%d", len(chunks), len(image_urls))
-    for ci, chunk_text in enumerate(chunks[:3]):
-        for match in img_marker_re.finditer(chunk_text):
+    # Динамические стоп-слова: слова, встречающиеся в >40% чанков — слишком общие
+    from collections import Counter
+    _base_stop = {"также", "далее", "если", "этого", "того", "может", "будет", "было", "быть", "этом"}
+    chunk_word_sets = []
+    for ct in chunks:
+        cleaned = img_marker_re.sub("", ct)
+        chunk_word_sets.append(set(re.findall(r"[А-Яа-яЁёA-Za-z0-9-]{4,}", cleaned.lower())))
+    doc_freq: Counter = Counter()
+    for ws in chunk_word_sets:
+        for w in ws:
+            doc_freq[w] += 1
+    n_chunks = max(len(chunks), 1)
+    _stop = _base_stop | {w for w, cnt in doc_freq.items() if cnt / n_chunks > 0.4}
+
+    def bag(text: str) -> set[str]:
+        cleaned = img_marker_re.sub("", text)
+        words = set(re.findall(r"[А-Яа-яЁёA-Za-z0-9-]{4,}", cleaned.lower()))
+        return words - _stop
+
+    # Для каждого маркера берём 1-2 предложения непосредственно перед ним
+    # (marker, preceding_bag, url)
+    marker_entries: list[tuple[str, set[str], str]] = []
+    for chunk_text in chunks:
+        markers_in_chunk = list(img_marker_re.finditer(chunk_text))
+        if not markers_in_chunk:
+            continue
+        for i, match in enumerate(markers_in_chunk):
             marker = match.group(0)
             url = image_urls.get(marker)
-            log.info("  chunk[%d] marker=%s url=%s", ci, marker, bool(url))
-            if url and marker not in seen:
-                seen.add(marker)
-                ordered_urls.append(url)
+            if not url:
+                continue
+            # Берём текст между предыдущим маркером и текущим
+            start = markers_in_chunk[i - 1].end() if i > 0 else 0
+            preceding = chunk_text[start:match.start()].strip()
+            # Берём последние 2 предложения — они ближе всего к рисунку
+            sentences = re.split(r"[.!?\n]+", preceding)
+            sentences = [s.strip() for s in sentences if s.strip()]
+            nearby = " ".join(sentences[-2:]) if sentences else ""
+            marker_entries.append((marker, bag(nearby), url))
 
-    log.info("_attach_images: ordered_urls=%d", len(ordered_urls))
-    if not ordered_urls:
+    if not marker_entries:
         return answer
 
     # Разбиваем ответ на пункты
@@ -932,10 +942,37 @@ def _attach_images_to_answer(
     if not points:
         return answer
 
+    used_markers: set[str] = set()
     result_parts: list[str] = []
-    for i, point in enumerate(points):
-        if i < len(ordered_urls):
-            result_parts.append(f"{point}\n{ordered_urls[i]}")
+
+    for point in points:
+        point_bag = bag(point)
+        if not point_bag:
+            result_parts.append(point)
+            continue
+
+        # Ищем лучший рисунок для этого пункта
+        best_marker = None
+        best_url = None
+        best_ratio = 0.0
+        best_overlap = 0
+        for marker, preceding_bag, url in marker_entries:
+            if marker in used_markers:
+                continue
+            if not preceding_bag:
+                continue
+            overlap = len(point_bag & preceding_bag)
+            ratio = overlap / min(len(point_bag), len(preceding_bag))
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best_overlap = overlap
+                best_marker = marker
+                best_url = url
+
+        # Порог: минимум 30% совпадения И минимум 3 значимых совпавших слова
+        if best_marker and best_ratio >= 0.3 and best_overlap >= 3:
+            used_markers.add(best_marker)
+            result_parts.append(f"{point}\n{best_url}")
         else:
             result_parts.append(point)
 
@@ -1094,7 +1131,7 @@ def _detect_chunk_profile(texts: list[str]) -> tuple[str, int, int]:
     heading_ratio = heading_like / total_lines
 
     if short_ratio > 0.45 or numbered_ratio > 0.15 or heading_ratio > 0.20:
-        return ("cheatsheet", 200, 30)
+        return ("cheatsheet", 350, 50)
     return ("manual", 800, 120)
 
 
@@ -1439,7 +1476,7 @@ async def ask(req: AskRequest, request: Request):
     top_k = max(1, raw_top_k or TOP_K)
 
     rewritten = await _rewrite_query(req.question)
-    log.info("Query: %r → %r | top_k=%d (raw=%r)", req.question, rewritten, top_k, raw_top_k)
+    log.info("Query rewrite: %r → %r", req.question, rewritten)
 
     try:
         q_emb = await _embed(rewritten)
@@ -1497,6 +1534,8 @@ async def ask(req: AskRequest, request: Request):
         f"[CHUNK {i} | {m['filename']}]\n{d}"
         for i, (d, m) in enumerate(zip(all_docs, all_metas))
     )
+    sources = list(dict.fromkeys(m["filename"] for m in all_metas))
+
     try:
         answer = await _chat(
             [
@@ -1507,7 +1546,6 @@ async def ask(req: AskRequest, request: Request):
                         "Используй только информацию из контекста ниже. Не придумывай то, чего нет в контексте.\n"
                         "Сохраняй порядок изложения из контекста.\n"
                         "Отвечай кратко и по существу, без вступлений.\n"
-                        "Оформляй ответ нумерованным списком (1. 2. 3.), каждый шаг — отдельным пунктом.\n"
                         "Если контекст содержит ответ — дай его. Если не содержит — ответь: Информация в документах не найдена."
                     ),
                 },
@@ -1525,8 +1563,6 @@ async def ask(req: AskRequest, request: Request):
 
     # Убираем блок рассуждений <think>...</think> (deepseek-r1 и подобные)
     answer = re.sub(r"<think>.*?</think>", "", answer, flags=re.DOTALL).strip()
-    # Убираем маркеры чанков [CHUNK N] / (CHUNK N), которые LLM может скопировать из контекста
-    answer = re.sub(r"\s*[\(\[]\s*CHUNK\s*\d+\s*[\)\]]", "", answer).strip()
 
     answer_clean = answer.strip()
     for quote in ['"', "'", "«", "»"]:
@@ -1538,53 +1574,6 @@ async def ask(req: AskRequest, request: Request):
             log.warning("Faithfulness check failed — suppressing answer")
             answer = "Информация в документах не найдена."
 
-    # Определяем основной документ (для картинок):
-    # 1) Совпадение корней слов вопроса с именем файла
-    # 2) Фоллбэк: документ, чьи чанки содержат больше УНИКАЛЬНЫХ слов из ответа
-    #    (слов, которых нет в чанках других документов)
-    def _roots(text: str) -> set[str]:
-        """Извлекает корни (первые 5 букв) значимых слов."""
-        return {w[:5] for w in re.findall(r"[а-яёa-z]{5,}", text.lower())}
-
-    q_roots = _roots(req.question)
-    unique_fnames = list(dict.fromkeys(m["filename"] for m in metas))
-    _fname_scores: dict[str, int] = {}
-    for fn in unique_fnames:
-        fn_roots = _roots(fn.replace("_", " ").replace("-", " "))
-        _fname_scores[fn] = len(q_roots & fn_roots)
-
-    best_fname_score = max(_fname_scores.values()) if _fname_scores else 0
-    if best_fname_score > 0:
-        _primary_doc = max(_fname_scores, key=_fname_scores.get)
-    else:
-        # Фоллбэк: для каждого документа считаем слова из ответа,
-        # которые есть ТОЛЬКО в его чанках (уникальные для документа)
-        _doc_words: dict[str, set[str]] = {}
-        for d, m in zip(docs, metas):
-            fn = m["filename"]
-            words = set(re.findall(r"[а-яёa-z]{4,}", d.lower()))
-            _doc_words.setdefault(fn, set()).update(words)
-
-        answer_w = set(re.findall(r"[а-яёa-z]{4,}", answer.lower()))
-        _doc_unique_scores: dict[str, int] = {}
-        for fn in unique_fnames:
-            # Слова этого документа, которых нет в других документах
-            other_words = set()
-            for fn2, w2 in _doc_words.items():
-                if fn2 != fn:
-                    other_words |= w2
-            unique_words = _doc_words.get(fn, set()) - other_words
-            _doc_unique_scores[fn] = len(answer_w & unique_words)
-
-        _primary_doc = max(_doc_unique_scores, key=_doc_unique_scores.get) \
-            if _doc_unique_scores and max(_doc_unique_scores.values()) > 0 \
-            else metas[0]["filename"]
-
-    log.info("Filename scores: %s", _fname_scores)
-    log.info("Primary doc: %s", _primary_doc)
-
-    # Источники: все уникальные документы, основной первым
-    sources = [_primary_doc] + [fn for fn in unique_fnames if fn != _primary_doc]
     base = _public_base_url(request)
     download_urls = {s: f"{base}/documents/{s}/download" for s in sources}
 
@@ -1601,14 +1590,11 @@ async def ask(req: AskRequest, request: Request):
                     f"{base}/documents/{meta['filename']}/images/{img_name}"
                 )
 
-    # Привязываем иллюстрации к пунктам ответа
-    # Берём только чанки основного документа — без примесей из других инструкций
-    _primary_docs = [d for d, m in zip(docs, metas) if m["filename"] == _primary_doc]
-    _primary_metas = [m for m in metas if m["filename"] == _primary_doc]
+    # Привязываем иллюстрации к пунктам ответа по содержимому чанков
     if image_urls and answer != _not_found:
-        answer = _attach_images_to_answer(answer, _primary_docs, _primary_metas, image_urls)
+        answer = _attach_images_to_answer(answer, all_docs, all_metas, image_urls)
 
-    answer_html = _answer_to_html(answer, image_urls, download_urls)
+    answer_html = _answer_to_html(answer, image_urls)
 
     return AskResponse(
         answer=answer,
