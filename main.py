@@ -1527,22 +1527,37 @@ async def ask(req: AskRequest, request: Request):
     base = _public_base_url(request)
     download_urls = {s: f"{base}/documents/{s}/download" for s in sources}
 
-    # Собираем ссылки на изображения ТОЛЬКО из оригинальных чанков поиска (docs),
-    # не из расширенных (all_docs) — чтобы не тянуть картинки из соседних секций
+    # Собираем ссылки на изображения СТРОГО из одного документа:
+    # находим первый чанк с картинками (самый релевантный) и берём
+    # картинки только из чанков с тем же именем файла
     image_urls: dict[str, str] = {}
     img_marker_re = re.compile(r"\[Рисунок (\d+): ([^\]]+)\]")
-    for doc_text, meta in zip(docs, metas):
-        for match in img_marker_re.finditer(doc_text):
-            img_name = match.group(2)
-            marker = match.group(0)
-            if marker not in image_urls:
-                image_urls[marker] = (
-                    f"{base}/documents/{meta['filename']}/images/{img_name}"
-                )
 
-    # Привязываем иллюстрации к пунктам ответа — строго из найденных чанков
+    # Определяем файл-источник картинок — первый чанк, содержащий маркер
+    _img_source_file = None
+    for doc_text, meta in zip(docs, metas):
+        if img_marker_re.search(doc_text):
+            _img_source_file = meta["filename"]
+            break
+
+    if _img_source_file:
+        _img_chunks = []
+        _img_metas = []
+        for doc_text, meta in zip(docs, metas):
+            if meta["filename"] == _img_source_file:
+                _img_chunks.append(doc_text)
+                _img_metas.append(meta)
+                for match in img_marker_re.finditer(doc_text):
+                    img_name = match.group(2)
+                    marker = match.group(0)
+                    if marker not in image_urls:
+                        image_urls[marker] = (
+                            f"{base}/documents/{meta['filename']}/images/{img_name}"
+                        )
+
+    # Привязываем иллюстрации к пунктам ответа — строго из одного документа
     if image_urls and answer != _not_found:
-        answer = _attach_images_to_answer(answer, docs, metas, image_urls)
+        answer = _attach_images_to_answer(answer, _img_chunks, _img_metas, image_urls)
 
     answer_html = _answer_to_html(answer, image_urls)
 
