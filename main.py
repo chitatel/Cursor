@@ -38,6 +38,7 @@ import numpy as np
 import aiofiles
 from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks, Request
 from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 APP_DIR = Path(__file__).resolve().parent
@@ -1261,6 +1262,9 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="RAG Ollama API v5.0", version="5.0.0", lifespan=lifespan)
 
+# Статическая раздача файлов — прямые ссылки для 1С
+app.mount("/files", StaticFiles(directory=str(FILES_DIR)), name="static_files")
+
 
 class AskRequest(BaseModel):
     question: str
@@ -1336,7 +1340,7 @@ async def list_documents(request: Request):
                 filename=fn,
                 chunks=n,
                 indexing_status=st,
-                download_url=f"{base}/documents/{fn}/download",
+                download_url=f"{base}/files/{fn}",
             )
         )
     return result
@@ -1630,7 +1634,7 @@ async def ask(req: AskRequest, request: Request):
                     fn.replace("_", " ").replace("-", " ").lower())}
         _fname_relevance[fn] = len(_q_roots & fn_roots)
     sources = sorted(_all_sources, key=lambda fn: _fname_relevance.get(fn, 0), reverse=True)
-    download_urls = {s: f"{base}/documents/{s}/download" for s in sources}
+    download_urls = {s: f"{base}/files/{s}" for s in sources}
 
     # Собираем чанки и картинки из расширенного контекста (all_docs),
     # но только из файла-источника картинок
@@ -1645,8 +1649,9 @@ async def ask(req: AskRequest, request: Request):
                     img_name = match.group(2)
                     marker = match.group(0)
                     if marker not in image_urls:
+                        stem = Path(meta["filename"]).stem
                         image_urls[marker] = (
-                            f"{base}/documents/{meta['filename']}/images/{img_name}"
+                            f"{base}/files/{stem}_images/{img_name}"
                         )
 
     # Привязываем иллюстрации к пунктам ответа — строго из одного документа
