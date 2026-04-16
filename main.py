@@ -900,10 +900,10 @@ def _attach_images_to_answer(
     image_urls: dict[str, str],
 ) -> str:
     """
-    Для каждого рисунка берём текст непосредственно перед его маркером в чанке.
-    Затем для каждого пункта ответа ищем рисунок, чей предшествующий текст
-    лучше всего совпадает с пунктом.  Так каждый рисунок привязывается
-    к конкретному шагу, а не ко всему чанку.
+    Группируем картинки, идущие подряд в чанке (без значимого текста между ними).
+    Для каждой группы берём текст перед первой картинкой группы.
+    Для каждого пункта ответа ищем группу с наибольшим пересечением слов.
+    Привязываем всю группу (все картинки) к пункту.
     """
     img_marker_re = re.compile(r"\[Рисунок \d+: [^\]]+\]")
 
@@ -911,22 +911,41 @@ def _attach_images_to_answer(
         cleaned = img_marker_re.sub("", text)
         return set(re.findall(r"[А-Яа-яЁёA-Za-z0-9-]{4,}", cleaned.lower()))
 
-    # Для каждого маркера собираем «контекст» — текст перед ним в чанке
-    marker_entries: list[tuple[str, set[str], str]] = []
+    # Группируем маркеры: если между двумя маркерами нет значимого текста
+    # (менее 3 слов), они образуют одну группу
+    # group = (preceding_bag, [url1, url2, ...])
+    groups: list[tuple[set[str], list[str]]] = []
     for chunk_text in chunks:
         markers_in_chunk = list(img_marker_re.finditer(chunk_text))
         if not markers_in_chunk:
             continue
+
+        current_group_urls: list[str] = []
+        current_group_preceding: set[str] = set()
+
         for i, match in enumerate(markers_in_chunk):
-            marker = match.group(0)
-            url = image_urls.get(marker)
+            url = image_urls.get(match.group(0))
             if not url:
                 continue
-            start = markers_in_chunk[i - 1].end() if i > 0 else 0
-            preceding = chunk_text[start:match.start()]
-            marker_entries.append((marker, bag(preceding), url))
 
-    if not marker_entries:
+            start = markers_in_chunk[i - 1].end() if i > 0 else 0
+            preceding_text = chunk_text[start:match.start()]
+            preceding_words = bag(preceding_text)
+
+            if i == 0 or len(preceding_words) >= 3:
+                # Начало новой группы: первый маркер или есть текст перед ним
+                if current_group_urls:
+                    groups.append((current_group_preceding, current_group_urls))
+                current_group_preceding = preceding_words
+                current_group_urls = [url]
+            else:
+                # Продолжение группы: между маркерами мало текста
+                current_group_urls.append(url)
+
+        if current_group_urls:
+            groups.append((current_group_preceding, current_group_urls))
+
+    if not groups:
         return answer
 
     # Разбиваем ответ на пункты
@@ -937,7 +956,7 @@ def _attach_images_to_answer(
     if not points:
         return answer
 
-    used_markers: set[str] = set()
+    used_groups: set[int] = set()
     result_parts: list[str] = []
 
     for point in points:
@@ -946,21 +965,20 @@ def _attach_images_to_answer(
             result_parts.append(point)
             continue
 
-        best_marker = None
-        best_url = None
+        best_idx = -1
         best_score = 0
-        for marker, preceding_bag, url in marker_entries:
-            if marker in used_markers:
+        for idx, (preceding_bag, urls) in enumerate(groups):
+            if idx in used_groups:
                 continue
             score = len(point_bag & preceding_bag)
             if score > best_score:
                 best_score = score
-                best_marker = marker
-                best_url = url
+                best_idx = idx
 
-        if best_marker and best_score >= 2:
-            used_markers.add(best_marker)
-            result_parts.append(f"{point}\n{best_url}")
+        if best_idx >= 0 and best_score >= 2:
+            used_groups.add(best_idx)
+            all_urls = "\n".join(groups[best_idx][1])
+            result_parts.append(f"{point}\n{all_urls}")
         else:
             result_parts.append(point)
 
@@ -1538,7 +1556,8 @@ async def ask(req: AskRequest, request: Request):
                         "Не смешивай основные шаги процесса с деталями заполнения полей или частными случаями — это разные уровни информации.\n"
                         "Если в контексте нет прямого ответа на вопрос, ответь ровно одной фразой: Информация в документах не найдена.\n"
                         "Если ответ есть — перескажи его кратко, сохраняя структуру и последовательность из контекста.\n"
-                        "Формат выбирай по смыслу вопроса: если спрашивают 'какие бывают', 'виды', 'типы', 'перечислить' — дай список элементов; если спрашивают 'как сделать', 'порядок', 'процесс' — дай пошаговую инструкцию только по основным шагам, без углубления в детали отдельных полей.\n"
+                        "Оформляй ответ единым нумерованным списком со сквозной нумерацией (1. 2. 3. ...), каждый шаг — отдельным пунктом. Не перезапускай нумерацию.\n"
+                        "Если спрашивают 'какие бывают', 'виды', 'типы', 'перечислить' — дай нумерованный список элементов; если спрашивают 'как сделать', 'порядок', 'процесс' — дай пошаговую инструкцию только по основным шагам, без углубления в детали отдельных полей.\n"
                         "Отвечай по существу, без введения и без рассуждений.\n"
                         "Не пиши фразы вроде: 'Давайте разберем', 'Вот пошаговая инструкция', 'Based on the provided documentation', 'Okay'.\n"
                         "Не переводи термины на английский и не смешивай языки.\n"
