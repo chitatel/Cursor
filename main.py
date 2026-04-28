@@ -36,7 +36,7 @@ from datetime import datetime, timezone
 import httpx
 import numpy as np
 import aiofiles
-from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks, Request
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, BackgroundTasks, Request
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -249,6 +249,54 @@ async def _document_chunk_counts() -> dict[str, int]:
     return counts
 
 
+def _normalize_category(category: Optional[str]) -> Optional[str]:
+    if category is None:
+        return None
+    cat = category.strip()
+    return cat or None
+
+
+async def _document_categories() -> dict[str, Optional[str]]:
+    """Карта filename → category (берётся из первой встретившейся записи)."""
+    result: dict[str, Optional[str]] = {}
+    for record in await _get_records():
+        fn = record["filename"]
+        if fn not in result:
+            result[fn] = record.get("category")
+    return result
+
+
+async def _list_categories() -> list[str]:
+    """Уникальные категории, отсортированные."""
+    cats: set[str] = set()
+    for record in await _get_records():
+        cat = record.get("category")
+        if cat:
+            cats.add(cat)
+    return sorted(cats)
+
+
+async def _document_category(filename: str) -> Optional[str]:
+    for record in await _get_records():
+        if record["filename"] == filename:
+            return record.get("category")
+    return None
+
+
+async def _update_document_category(filename: str, category: Optional[str]) -> int:
+    """Обновляет категорию у всех чанков документа без переиндексации."""
+    async with _records_lock:
+        records = _load_records_sync()
+        updated = 0
+        for r in records:
+            if r["filename"] == filename:
+                r["category"] = category
+                updated += 1
+        if updated:
+            _save_records_sync(records)
+        return updated
+
+
 async def _document_records(filename: str) -> list[dict]:
     return [r for r in await _get_records() if r["filename"] == filename]
 
@@ -401,8 +449,18 @@ def _rrf_fusion(
     return sorted(scores, key=lambda x: scores[x], reverse=True)
 
 
-async def _search_records(query: str, query_embedding: list[float], top_k: int) -> dict:
-    """Гибридный поиск: FAISS-кандидаты + глобальные lexical-кандидаты + RRF fusion."""
+async def _search_records(
+    query: str,
+    query_embedding: list[float],
+    top_k: int,
+    category: Optional[str] = None,
+) -> dict:
+    """Гибридный поиск: FAISS-кандидаты + глобальные lexical-кандидаты + RRF fusion.
+
+    Если задана category — поиск ограничен только чанками этой категории.
+    FAISS ищет по всему индексу, но результаты фильтруются по category;
+    BM25 работает только по подмножеству, так что фильтр учитывается на обоих этапах.
+    """
     async with _records_lock:
         records = _load_records_sync()
         index = _get_faiss_index_sync(records)
@@ -410,29 +468,45 @@ async def _search_records(query: str, query_embedding: list[float], top_k: int) 
     if not records:
         return {"ids": [[]], "documents": [[]], "metadatas": [[]], "distances": [[]]}
 
+    if category is not None:
+        allowed_ids = {r["id"] for r in records if r.get("category") == category}
+        if not allowed_ids:
+            return {"ids": [[]], "documents": [[]], "metadatas": [[]], "distances": [[]]}
+    else:
+        allowed_ids = None
+
     id_to_record = {r["id"]: r for r in records}
     vector_ids: list[str] = []
     vector_distances: dict[str, float] = {}
     if index is not None:
         vec = np.asarray([query_embedding], dtype="float32")
-        vector_fetch_k = min(max(top_k * 8, 12), len(records))
+        # При фильтре по категории берём больше кандидатов от FAISS, т.к. часть отсеется
+        multiplier = 16 if allowed_ids is not None else 8
+        vector_fetch_k = min(max(top_k * multiplier, 12), len(records))
         scores, indices = index.search(vec, vector_fetch_k)
         for score, idx in zip(scores[0], indices[0]):
             if idx < 0:
                 continue
             record = records[int(idx)]
+            if allowed_ids is not None and record["id"] not in allowed_ids:
+                continue
             vector_ids.append(record["id"])
             vector_distances[record["id"]] = float(1 - score)
 
-    lexical_fetch_k = min(max(top_k * 8, 12), len(records))
-    lexical_texts = [f"{record['filename']} {record['text']}" for record in records]
+    # BM25 — только по подмножеству, если задан фильтр
+    if allowed_ids is not None:
+        lexical_records = [r for r in records if r["id"] in allowed_ids]
+    else:
+        lexical_records = records
+    lexical_fetch_k = min(max(top_k * 8, 12), len(lexical_records))
+    lexical_texts = [f"{record['filename']} {record['text']}" for record in lexical_records]
     lexical_scores = _bm25_scores(query, lexical_texts)
     lexical_scores = [
         score + _filename_match_boost(query, record["filename"])
-        for score, record in zip(lexical_scores, records)
+        for score, record in zip(lexical_scores, lexical_records)
     ]
     lexical_ids = [
-        records[i]["id"]
+        lexical_records[i]["id"]
         for i in sorted(range(len(lexical_scores)), key=lambda x: lexical_scores[x], reverse=True)[:lexical_fetch_k]
         if lexical_scores[i] > 0
     ]
@@ -1070,6 +1144,58 @@ def _extract_docx_with_images(path: Path) -> list:
     return [Document(text=full_text, metadata={"filename": path.name})]
 
 
+def _extract_pdf_with_images(path: Path) -> list:
+    """
+    Извлекает текст из .pdf с сохранением изображений.
+    Изображения сохраняются в FILES_DIR/<stem>_images/img_001.ext и т.д.
+    В текст вставляются маркеры [Рисунок N: img_NNN.ext] после текста каждой страницы.
+    """
+    from pypdf import PdfReader
+    from llama_index.core.schema import Document
+
+    reader = PdfReader(str(path))
+    stem = path.stem
+    images_dir = FILES_DIR / f"{stem}_images"
+    images_dir.mkdir(exist_ok=True)
+
+    img_counter = 0
+    parts: list[str] = []
+
+    for page_num, page in enumerate(reader.pages):
+        # Извлекаем текст страницы
+        page_text = (page.extract_text() or "").strip()
+        if page_text:
+            parts.append(page_text)
+
+        # Извлекаем изображения страницы
+        page_images: list[str] = []
+        if hasattr(page, "images"):
+            for img in page.images:
+                img_counter += 1
+                ext = Path(img.name).suffix.lower() or ".png"
+                if ext not in (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tiff"):
+                    ext = ".png"
+                img_name = f"img_{img_counter:03d}{ext}"
+                img_path = images_dir / img_name
+                img_path.write_bytes(img.data)
+                marker = f"[Рисунок {img_counter}: {img_name}]"
+                page_images.append(marker)
+                log.info("[%s] Extracted image from page %d: %s", path.name, page_num + 1, img_name)
+
+        for marker in page_images:
+            parts.append(marker)
+
+    full_text = "\n".join(parts).strip()
+    if not full_text:
+        raise ValueError("No text extracted from PDF file")
+
+    if img_counter == 0:
+        images_dir.rmdir()
+
+    log.info("[%s] Extracted %d images from PDF", path.name, img_counter)
+    return [Document(text=full_text, metadata={"filename": path.name})]
+
+
 # ── Загрузка документов ───────────────────────────────────────────────────────
 
 def _load_documents(path: Path):
@@ -1077,6 +1203,9 @@ def _load_documents(path: Path):
 
     if suffix == ".docx":
         return _extract_docx_with_images(path)
+
+    if suffix == ".pdf":
+        return _extract_pdf_with_images(path)
 
     if suffix == ".msg":
         try:
@@ -1144,9 +1273,10 @@ def _detect_chunk_profile(texts: list[str]) -> tuple[str, int, int]:
 
 # ── Индексирование ────────────────────────────────────────────────────────────
 
-async def _run_indexing(filename: str, dest: Path):
+async def _run_indexing(filename: str, dest: Path, category: Optional[str] = None):
     lock = asyncio.Lock()
     _indexing_locks[filename] = lock
+    category = _normalize_category(category)
 
     async with lock:
         _indexing[filename] = {
@@ -1156,6 +1286,7 @@ async def _run_indexing(filename: str, dest: Path):
             "error": None,
             "started_at": datetime.now(timezone.utc).isoformat(),
             "finished_at": None,
+            "category": category,
         }
         try:
             from llama_index.core.node_parser import SentenceSplitter
@@ -1207,6 +1338,7 @@ async def _run_indexing(filename: str, dest: Path):
                             "chunk_index": batch_start + offset,
                             "text": text,
                             "embedding": _normalize_embedding(emb),
+                            "category": category,
                         }
                     )
                     done += 1
@@ -1269,6 +1401,7 @@ app.mount("/files", StaticFiles(directory=str(FILES_DIR)), name="static_files")
 class AskRequest(BaseModel):
     question: str
     top_k: Optional[int] = None
+    category: Optional[str] = None
 
 
 class AskResponse(BaseModel):
@@ -1285,6 +1418,7 @@ class AskResponse(BaseModel):
 class UploadResponse(BaseModel):
     filename: str
     status: str
+    category: Optional[str] = None
 
 
 class DocumentInfo(BaseModel):
@@ -1292,6 +1426,11 @@ class DocumentInfo(BaseModel):
     chunks: int
     indexing_status: str
     download_url: str
+    category: Optional[str] = None
+
+
+class CategoryUpdateRequest(BaseModel):
+    category: Optional[str] = None
 
 
 class IndexingStatus(BaseModel):
@@ -1327,13 +1466,18 @@ async def status():
 
 
 @app.get("/documents", response_model=list[DocumentInfo])
-async def list_documents(request: Request):
+async def list_documents(request: Request, category: Optional[str] = None):
     counts = await _document_chunk_counts()
+    cats = await _document_categories()
     for fn in _indexing:
         counts.setdefault(fn, 0)
     base = _public_base_url(request)
+    cat_filter = _normalize_category(category)
     result = []
     for fn, n in sorted(counts.items()):
+        doc_cat = cats.get(fn) or _indexing.get(fn, {}).get("category")
+        if cat_filter is not None and doc_cat != cat_filter:
+            continue
         st = _indexing.get(fn, {}).get("status", "ready" if n > 0 else "unknown")
         result.append(
             DocumentInfo(
@@ -1341,13 +1485,23 @@ async def list_documents(request: Request):
                 chunks=n,
                 indexing_status=st,
                 download_url=f"{base}/files/{fn}",
+                category=doc_cat,
             )
         )
     return result
 
 
+@app.get("/categories", response_model=list[str])
+async def list_categories():
+    return await _list_categories()
+
+
 @app.post("/documents", response_model=UploadResponse, status_code=202)
-async def upload_document(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+async def upload_document(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    category: Optional[str] = Form(None),
+):
     filename = _safe_filename(file.filename)
     suffix = Path(filename).suffix.lower()
     if suffix not in SUPPORTED:
@@ -1361,8 +1515,9 @@ async def upload_document(background_tasks: BackgroundTasks, file: UploadFile = 
     async with aiofiles.open(dest, "wb") as f:
         while chunk := await file.read(1024 * 256):
             await f.write(chunk)
-    background_tasks.add_task(_run_indexing, filename, dest)
-    return UploadResponse(filename=filename, status="indexing_started")
+    norm_cat = _normalize_category(category)
+    background_tasks.add_task(_run_indexing, filename, dest, norm_cat)
+    return UploadResponse(filename=filename, status="indexing_started", category=norm_cat)
 
 
 @app.get("/documents/{filename}/download")
@@ -1419,29 +1574,42 @@ async def document_status(filename: str):
 
 
 @app.post("/documents/{filename}/reindex")
-async def reindex_document(filename: str, background_tasks: BackgroundTasks):
-    """Переиндексировать существующий документ без повторной загрузки."""
+async def reindex_document(
+    filename: str,
+    background_tasks: BackgroundTasks,
+    category: Optional[str] = None,
+):
+    """Переиндексировать существующий документ без повторной загрузки.
+
+    Если category не задана — сохраняем существующую категорию документа.
+    Чтобы явно сбросить категорию, передайте пустую строку.
+    """
     filename = _safe_filename(filename)
     dest = FILES_DIR / filename
     if not dest.exists():
         raise HTTPException(404, f"File '{filename}' not found")
     if _indexing.get(filename, {}).get("status") == "indexing":
         raise HTTPException(409, f"'{filename}' is already being indexed")
+    if category is None:
+        effective_cat = await _document_category(filename)
+    else:
+        effective_cat = _normalize_category(category)
     # Удаляем старые чанки и картинки
     await _delete_document_records(filename)
     images_dir = FILES_DIR / f"{Path(filename).stem}_images"
     if images_dir.is_dir():
         shutil.rmtree(images_dir, ignore_errors=True)
-    background_tasks.add_task(_run_indexing, filename, dest)
-    return {"filename": filename, "status": "reindexing_started"}
+    background_tasks.add_task(_run_indexing, filename, dest, effective_cat)
+    return {"filename": filename, "status": "reindexing_started", "category": effective_cat}
 
 
 @app.post("/documents/reindex-all")
 async def reindex_all(background_tasks: BackgroundTasks):
-    """Переиндексировать все документы."""
+    """Переиндексировать все документы (категории сохраняются)."""
     files = [f for f in FILES_DIR.iterdir() if f.is_file() and f.suffix.lower() in SUPPORTED]
     if not files:
         raise HTTPException(404, "No documents found")
+    cats = await _document_categories()
     started = []
     skipped = []
     for dest in files:
@@ -1449,13 +1617,25 @@ async def reindex_all(background_tasks: BackgroundTasks):
         if _indexing.get(fn, {}).get("status") == "indexing":
             skipped.append(fn)
             continue
+        existing_cat = cats.get(fn)
         await _delete_document_records(fn)
         images_dir = FILES_DIR / f"{dest.stem}_images"
         if images_dir.is_dir():
             shutil.rmtree(images_dir, ignore_errors=True)
-        background_tasks.add_task(_run_indexing, fn, dest)
+        background_tasks.add_task(_run_indexing, fn, dest, existing_cat)
         started.append(fn)
     return {"started": started, "skipped_already_indexing": skipped}
+
+
+@app.put("/documents/{filename}/category")
+async def update_document_category(filename: str, body: CategoryUpdateRequest):
+    """Изменить категорию документа без переиндексации."""
+    filename = _safe_filename(filename)
+    if not await _document_records(filename):
+        raise HTTPException(404, f"Document '{filename}' not found in index")
+    norm_cat = _normalize_category(body.category)
+    updated = await _update_document_category(filename, norm_cat)
+    return {"filename": filename, "category": norm_cat, "chunks_updated": updated}
 
 
 @app.delete("/documents/{filename}")
@@ -1495,7 +1675,8 @@ async def ask(req: AskRequest, request: Request):
     except Exception as e:
         raise HTTPException(502, f"Embedding API error: {e}")
 
-    results = await _search_records(rewritten, _normalize_embedding(q_emb), top_k)
+    category = _normalize_category(req.category)
+    results = await _search_records(rewritten, _normalize_embedding(q_emb), top_k, category=category)
 
     docs = results["documents"][0]
     metas = results["metadatas"][0]
