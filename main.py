@@ -71,6 +71,7 @@ STORAGE_DIR = Path(_config_value("STORAGE_DIR"))
 if not STORAGE_DIR.is_absolute():
     STORAGE_DIR = (APP_DIR / STORAGE_DIR).resolve()
 FILES_DIR = STORAGE_DIR / "files"
+PREPARED_DIR = STORAGE_DIR / "prepared"
 INDEX_FILE = STORAGE_DIR / "index.json"
 FAISS_INDEX_FILE = STORAGE_DIR / "index.faiss"
 TOP_K = int(_config_value("TOP_K"))
@@ -105,6 +106,7 @@ log = logging.getLogger(__name__)
 
 STORAGE_DIR.mkdir(exist_ok=True)
 FILES_DIR.mkdir(exist_ok=True)
+PREPARED_DIR.mkdir(exist_ok=True)
 
 SUPPORTED = {".pdf", ".docx", ".txt", ".md", ".msg"}
 
@@ -850,6 +852,168 @@ async def _rewrite_query(q: str) -> str:
     return q
 
 
+# ── Document preparation ──────────────────────────────────────────────────────
+
+PREPARE_DOCUMENT_PROMPT = """Ты готовишь документ для RAG-индексации.
+
+Правила:
+1. Не добавляй новых фактов и не удаляй важные детали.
+2. Один логический шаг = один абзац.
+3. Длинные абзацы разбивай на блоки до 700 символов.
+4. Пошаговые инструкции оформляй нумерованным списком.
+5. Заголовки оставляй отдельными строками.
+6. Маркеры вида [Рисунок N: имя] сохрани строго без изменений.
+7. Перед каждым маркером [Рисунок N: имя] должен быть текст с 2-4 значимыми словами, описывающими действие, экран, кнопку или поле.
+8. Если перед картинкой нет контекста, добавь короткую фразу из ближайшего текста.
+9. Табличные инструкции преобразуй в обычные списки.
+10. Не используй заголовки вида "Рисунок 1" или "Рис. 2".
+
+Верни только подготовленный текст."""
+
+
+def _strip_code_fence(text: str) -> str:
+    stripped = text.strip()
+    if not stripped.startswith("```"):
+        return stripped
+    stripped = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", stripped)
+    stripped = re.sub(r"\s*```$", "", stripped)
+    return stripped.strip()
+
+
+def _split_text_for_prepare(text: str, max_chars: int = 6000) -> list[str]:
+    paragraphs = re.split(r"\n{2,}", text.strip())
+    chunks: list[str] = []
+    current: list[str] = []
+    current_len = 0
+
+    for paragraph in paragraphs:
+        paragraph = paragraph.strip()
+        if not paragraph:
+            continue
+        if current and current_len + len(paragraph) + 2 > max_chars:
+            chunks.append("\n\n".join(current))
+            current = []
+            current_len = 0
+        current.append(paragraph)
+        current_len += len(paragraph) + 2
+
+    if current:
+        chunks.append("\n\n".join(current))
+    return chunks or [text.strip()]
+
+
+async def _normalize_text_for_rag(text: str) -> str:
+    parts = _split_text_for_prepare(text)
+    normalized: list[str] = []
+    for idx, part in enumerate(parts, start=1):
+        content = await _chat(
+            [
+                {"role": "system", "content": PREPARE_DOCUMENT_PROMPT},
+                {
+                    "role": "user",
+                    "content": (
+                        f"Фрагмент {idx}/{len(parts)}. Подготовь его по правилам.\n\n"
+                        f"{part}"
+                    ),
+                },
+            ],
+            max_tokens=3500,
+        )
+        normalized.append(_strip_code_fence(content))
+    return "\n\n".join(p for p in normalized if p).strip()
+
+
+def _significant_words(text: str) -> list[str]:
+    return re.findall(r"[A-Za-zА-Яа-яЁё0-9]{4,}", text.lower())
+
+
+def _image_markers(text: str) -> list[str]:
+    return re.findall(r"\[Рисунок\s+\d+:\s+[^\]]+\]", text)
+
+
+def _validate_prepared_text(text: str, source_filename: str, source_text: str = "") -> list[str]:
+    warnings: list[str] = []
+    paragraphs = [p.strip() for p in re.split(r"\n{2,}", text) if p.strip()]
+
+    for idx, paragraph in enumerate(paragraphs, start=1):
+        if len(paragraph) > 800:
+            warnings.append(f"Абзац {idx} длиннее 800 символов ({len(paragraph)}).")
+
+    marker_re = re.compile(r"\[Рисунок\s+(\d+):\s+([^\]]+)\]")
+    markers = list(marker_re.finditer(text))
+    if source_text:
+        source_markers = set(_image_markers(source_text))
+        prepared_markers = set(_image_markers(text))
+        missing = sorted(source_markers - prepared_markers)
+        extra = sorted(prepared_markers - source_markers)
+        if missing:
+            warnings.append(f"LLM потеряла маркеры изображений: {', '.join(missing[:5])}.")
+        if extra:
+            warnings.append(f"LLM добавила новые маркеры изображений: {', '.join(extra[:5])}.")
+
+    seen_markers: set[str] = set()
+    for marker in markers:
+        marker_text = marker.group(0)
+        if marker_text in seen_markers:
+            warnings.append(f"Повторяется маркер изображения: {marker_text}.")
+        seen_markers.add(marker_text)
+
+        before = text[max(0, marker.start() - 220): marker.start()]
+        words = _significant_words(before)
+        if len(words) < 2:
+            warnings.append(f"Перед {marker_text} меньше 2 значимых слов контекста.")
+
+    bad_caption_re = re.compile(r"(?im)^\s*(рисунок|рис\.)\s*\d+\.?\s*$")
+    for match in bad_caption_re.finditer(text):
+        warnings.append(f"Найден отдельный заголовок '{match.group(0).strip()}', он может ломать привязку картинок.")
+
+    stem_words = _significant_words(Path(source_filename).stem)
+    if len(stem_words) < 2:
+        warnings.append("Имя файла слишком короткое или не отражает тему документа.")
+
+    return warnings
+
+
+def _prepared_filename(filename: str) -> str:
+    source = Path(filename)
+    stem = re.sub(r"[^A-Za-zА-Яа-яЁё0-9_. -]+", "_", source.stem).strip(" ._")
+    if not stem:
+        stem = "document"
+    return f"{stem}_prepared.docx"
+
+
+def _add_text_to_docx(doc, text: str) -> None:
+    for block in re.split(r"\n{2,}", text.strip()):
+        block = block.strip()
+        if block:
+            doc.add_paragraph(block)
+
+
+def _write_prepared_docx(text: str, out_path: Path, images_dir: Path) -> None:
+    from docx import Document as DocxDocument
+    from docx.shared import Inches
+
+    doc = DocxDocument()
+    marker_re = re.compile(r"\[Рисунок\s+\d+:\s+([^\]]+)\]")
+    pos = 0
+
+    for match in marker_re.finditer(text):
+        _add_text_to_docx(doc, text[pos: match.start()])
+        img_name = Path(match.group(1)).name
+        img_path = images_dir / img_name
+        if img_path.exists():
+            try:
+                doc.add_picture(str(img_path), width=Inches(6.0))
+            except Exception:
+                doc.add_paragraph(match.group(0))
+        else:
+            doc.add_paragraph(match.group(0))
+        pos = match.end()
+
+    _add_text_to_docx(doc, text[pos:])
+    doc.save(str(out_path))
+
+
 # ── Faithfulness check ────────────────────────────────────────────────────────
 
 def _is_faithful(answer: str, context: str) -> bool:
@@ -1396,6 +1560,7 @@ app = FastAPI(title="RAG Ollama API v5.0", version="5.0.0", lifespan=lifespan)
 
 # Статическая раздача файлов — прямые ссылки для 1С
 app.mount("/files", StaticFiles(directory=str(FILES_DIR)), name="static_files")
+app.mount("/prepared", StaticFiles(directory=str(PREPARED_DIR)), name="prepared_files")
 
 
 class AskRequest(BaseModel):
@@ -1419,6 +1584,16 @@ class UploadResponse(BaseModel):
     filename: str
     status: str
     category: Optional[str] = None
+
+
+class PrepareResponse(BaseModel):
+    source_filename: str
+    prepared_filename: str
+    status: str
+    warnings: list[str]
+    download_url: str
+    text_url: str
+    report_url: str
 
 
 class DocumentInfo(BaseModel):
@@ -1518,6 +1693,84 @@ async def upload_document(
     norm_cat = _normalize_category(category)
     background_tasks.add_task(_run_indexing, filename, dest, norm_cat)
     return UploadResponse(filename=filename, status="indexing_started", category=norm_cat)
+
+
+@app.post("/documents/prepare", response_model=PrepareResponse)
+async def prepare_document(
+    request: Request,
+    file: UploadFile = File(...),
+):
+    filename = _safe_filename(file.filename)
+    suffix = Path(filename).suffix.lower()
+    if suffix not in SUPPORTED:
+        raise HTTPException(
+            400,
+            f"Unsupported type '{suffix}'. Supported: {', '.join(sorted(SUPPORTED))}",
+        )
+
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    raw_path = PREPARED_DIR / f"source_{ts}_{filename}"
+    async with aiofiles.open(raw_path, "wb") as f:
+        while chunk := await file.read(1024 * 256):
+            await f.write(chunk)
+
+    images_dir = FILES_DIR / f"{raw_path.stem}_images"
+    if images_dir.is_dir():
+        shutil.rmtree(images_dir, ignore_errors=True)
+
+    try:
+        loop = asyncio.get_running_loop()
+        docs = await loop.run_in_executor(None, lambda: _load_documents(raw_path))
+        source_text = "\n\n".join(
+            getattr(doc, "text", "").strip()
+            for doc in docs
+            if getattr(doc, "text", "").strip()
+        )
+        if not source_text:
+            raise ValueError("No text extracted from file")
+
+        prepared_text = await _normalize_text_for_rag(source_text)
+        warnings = _validate_prepared_text(prepared_text, filename, source_text=source_text)
+    except Exception as e:
+        log.error("[%s] prepare failed: %s", filename, e)
+        raise HTTPException(500, f"Document prepare failed: {e}") from e
+    finally:
+        raw_path.unlink(missing_ok=True)
+
+    prepared_name = _prepared_filename(filename)
+    prepared_path = PREPARED_DIR / prepared_name
+    images_dir = FILES_DIR / f"{raw_path.stem}_images"
+    await asyncio.to_thread(_write_prepared_docx, prepared_text, prepared_path, images_dir)
+
+    prepared_text_name = f"{Path(prepared_name).stem}.md"
+    prepared_text_path = PREPARED_DIR / prepared_text_name
+    prepared_text_path.write_text(prepared_text, encoding="utf-8")
+
+    if images_dir.is_dir():
+        shutil.rmtree(images_dir, ignore_errors=True)
+
+    report_name = f"{Path(prepared_name).stem}_report.json"
+    report_path = PREPARED_DIR / report_name
+    report = {
+        "source_filename": filename,
+        "prepared_filename": prepared_name,
+        "status": "ok" if not warnings else "warnings",
+        "warnings": warnings,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "llm_model": OLLAMA_LLM_MODEL,
+    }
+    report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    base = _public_base_url(request)
+    return PrepareResponse(
+        source_filename=filename,
+        prepared_filename=prepared_name,
+        status=report["status"],
+        warnings=warnings,
+        download_url=f"{base}/prepared/{prepared_name}",
+        text_url=f"{base}/prepared/{prepared_text_name}",
+        report_url=f"{base}/prepared/{report_name}",
+    )
 
 
 @app.get("/documents/{filename}/download")
