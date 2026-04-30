@@ -2209,35 +2209,90 @@ async def ask(req: AskRequest, request: Request):
         base = _public_base_url(request)
 
         # Собираем ссылки на изображения СТРОГО из одного документа.
-        # Приоритет: документ, чьё имя файла совпадает с темой вопроса.
-        # Фоллбэк: первый чанк с картинками (самый релевантный).
+        # Главный критерий: текстовая близость чанка с картинками к уже
+        # сформированному ответу и вопросу. Имя файла используется только
+        # как последний fallback, иначе похожие названия перетягивают картинки
+        # из смыслово другого документа.
         image_urls: dict[str, str] = {}
         img_marker_re = re.compile(r"\[Рисунок (\d+): ([^\]]+)\]")
 
         # Корни слов вопроса (первые 5 букв слов длиной ≥5)
         _q_roots = {w[:5] for w in re.findall(r"[а-яёa-z]{5,}", req.question.lower())}
+        _question_terms = _query_terms(req.question)
+        _answer_terms = _query_terms(answer)
 
-        # Ищем документ с картинками, чьё имя файла лучше всего совпадает с вопросом
+        # Ищем документ с картинками, чей текст рядом с картинками лучше всего
+        # совпадает с ответом/вопросом.
         _img_source_file = None
+        _best_image_score = 0.0
+        _best_text_score = 0
         _best_fname_score = 0
         _img_chunk_counts: dict[str, int] = {}  # файл → кол-во чанков с картинками
-        for doc_text, meta in zip(docs, metas):
+        _img_text_scores: dict[str, int] = {}
+        _img_fname_scores: dict[str, int] = {}
+
+        for doc_rank, (doc_text, meta) in enumerate(zip(all_docs, all_metas)):
             fn = meta["filename"]
-            if img_marker_re.search(doc_text):
-                _img_chunk_counts[fn] = _img_chunk_counts.get(fn, 0) + 1
-                fn_roots = {w[:5] for w in re.findall(r"[а-яёa-z]{5,}",
-                            fn.replace("_", " ").replace("-", " ").lower())}
-                score = len(_q_roots & fn_roots)
-                if score > _best_fname_score:
-                    _best_fname_score = score
+            markers = list(img_marker_re.finditer(doc_text))
+            if not markers:
+                continue
+
+            _img_chunk_counts[fn] = _img_chunk_counts.get(fn, 0) + 1
+
+            chunk_terms = _sentence_terms(img_marker_re.sub(" ", doc_text))
+            chunk_score = (
+                len(_answer_terms & chunk_terms) * 3
+                + len(_question_terms & chunk_terms)
+            )
+
+            marker_score = 0
+            for marker in markers:
+                start = max(0, marker.start() - 700)
+                end = min(len(doc_text), marker.end() + 300)
+                marker_terms = _sentence_terms(
+                    img_marker_re.sub(" ", doc_text[start:end])
+                )
+                marker_score = max(
+                    marker_score,
+                    len(_answer_terms & marker_terms) * 4
+                    + len(_question_terms & marker_terms) * 2,
+                )
+
+            text_score = max(chunk_score, marker_score)
+            score = text_score + 1 / (doc_rank + 1)
+            if text_score > _img_text_scores.get(fn, 0):
+                _img_text_scores[fn] = text_score
+
+            fn_roots = {w[:5] for w in re.findall(r"[а-яёa-z]{5,}",
+                        fn.replace("_", " ").replace("-", " ").lower())}
+            _img_fname_scores[fn] = len(_q_roots & fn_roots)
+
+            if text_score > 0 and score > _best_image_score:
+                _best_image_score = score
+                _best_text_score = text_score
+                _img_source_file = fn
+
+        # Если текст не дал уверенного совпадения, используем старый fallback по имени.
+        if not _img_source_file and _img_chunk_counts:
+            for fn in _img_chunk_counts:
+                fname_score = _img_fname_scores.get(fn, 0)
+                if fname_score > _best_fname_score:
+                    _best_fname_score = fname_score
                     _img_source_file = fn
 
-        # Фоллбэк: документ с наибольшим числом чанков с картинками
+        # Последний фоллбэк: документ с наибольшим числом чанков с картинками.
         if not _img_source_file and _img_chunk_counts:
             _img_source_file = max(_img_chunk_counts, key=_img_chunk_counts.get)
 
-        log.info("Image source: %s (fname_score=%d, img_chunks=%s)",
-                 _img_source_file, _best_fname_score, _img_chunk_counts)
+        log.info(
+            "Image source: %s (text_score=%d, rank_score=%.2f, text_scores=%s, fname_scores=%s, img_chunks=%s)",
+            _img_source_file,
+            _best_text_score,
+            _best_image_score,
+            _img_text_scores,
+            _img_fname_scores,
+            _img_chunk_counts,
+        )
 
         # Источники: самый релевантный документ (по совпадению имени с вопросом) первым
         _fname_relevance: dict[str, int] = {}
