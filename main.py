@@ -471,14 +471,26 @@ def _filename_match_boost(query: str, filename: str) -> float:
     Небольшой лексический boost по имени файла.
     Это помогает общим запросам вроде "как согласовать документ" поднимать
     файлы, в названии которых есть близкие ключи, не ломая основной ranking.
+
+    Используется prefix-stemming (5 символов) — те же правила, что в BM25:
+    "согласует" матчится с "согласующего" в имени файла.
     """
+    _STEM_LEN = 5
     query_tokens = set(re.findall(r"[A-Za-zА-Яа-яЁё0-9]+", query.lower()))
     if not query_tokens:
         return 0.0
     filename_tokens = set(re.findall(r"[A-Za-zА-Яа-яЁё0-9]+", Path(filename).stem.lower()))
     if not filename_tokens:
         return 0.0
-    overlap = len(query_tokens & filename_tokens)
+
+    exact_overlap = len(query_tokens & filename_tokens)
+
+    # Prefix-overlap: совпадения по первым 5 буквам токенов длиной ≥5
+    query_prefixes = {t[:_STEM_LEN] for t in query_tokens if len(t) >= _STEM_LEN}
+    file_prefixes = {t[:_STEM_LEN] for t in filename_tokens if len(t) >= _STEM_LEN}
+    prefix_overlap = len(query_prefixes & file_prefixes)
+
+    overlap = max(exact_overlap, prefix_overlap)
     # Boost небольшой и дискретный: он только помогает shortlist, а не заменяет FAISS.
     return min(overlap * 0.35, 1.4)
 
@@ -1095,6 +1107,70 @@ def _is_faithful(answer: str, context: str) -> bool:
         )
         return False
     return True
+
+
+def _query_terms(text: str) -> set[str]:
+    stop_words = {
+        "какой", "какая", "какие", "какое", "кто", "что", "где", "куда", "когда",
+        "если", "или", "для", "при", "про", "как", "это", "этот", "эта", "эти",
+        "документ", "документа", "документы", "файл", "файла",
+    }
+    terms: set[str] = set()
+    for word in re.findall(r"[A-Za-zА-Яа-яЁё0-9]{4,}", text.lower()):
+        if word not in stop_words:
+            terms.add(word)
+            if len(word) >= 5:
+                terms.add(word[:5])
+    return terms
+
+
+def _sentence_terms(text: str) -> set[str]:
+    terms: set[str] = set()
+    for word in re.findall(r"[A-Za-zА-Яа-яЁё0-9]{4,}", text.lower()):
+        terms.add(word)
+        if len(word) >= 5:
+            terms.add(word[:5])
+    return terms
+
+
+def _most_relevant_fragments(
+    query: str,
+    docs: list[str],
+    metas: list[dict],
+    limit: int = 5,
+) -> list[str]:
+    q_terms = _query_terms(query)
+    if not q_terms:
+        return []
+
+    scored: list[tuple[float, int, str]] = []
+    for doc_idx, (doc_text, meta) in enumerate(zip(docs, metas)):
+        sentences = [
+            part.strip()
+            for part in re.split(r"(?<=[.!?])\s+|\n+", doc_text)
+            if part.strip()
+        ]
+        for sentence in sentences:
+            s_terms = _sentence_terms(sentence)
+            overlap = len(q_terms & s_terms)
+            if overlap == 0:
+                continue
+            score = overlap + 1 / (doc_idx + 1)
+            filename = meta.get("filename", "")
+            chunk_index = meta.get("chunk_index", 0)
+            scored.append((score, doc_idx, f"[{filename} | chunk {chunk_index}] {sentence}"))
+
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    fragments: list[str] = []
+    seen: set[str] = set()
+    for _, _, fragment in scored:
+        if fragment in seen:
+            continue
+        seen.add(fragment)
+        fragments.append(fragment)
+        if len(fragments) >= limit:
+            break
+    return fragments
 
 
 # ── Форматирование ответа в HTML ─────────────────────────────────────────────
@@ -2069,6 +2145,11 @@ async def ask(req: AskRequest, request: Request):
             f"[CHUNK {i} | {m['filename']}]\n{d}"
             for i, (d, m) in enumerate(zip(all_docs, all_metas))
         )
+        relevant_fragments = _most_relevant_fragments(req.question, all_docs, all_metas)
+        relevant_context = "\n".join(
+            f"{i}. {fragment}"
+            for i, fragment in enumerate(relevant_fragments, start=1)
+        )
         _all_sources = list(dict.fromkeys(m["filename"] for m in all_metas))
 
         try:
@@ -2083,6 +2164,7 @@ async def ask(req: AskRequest, request: Request):
                             "Строго запрещено придумывать шаги, роли, ограничения, числа, лимиты, сроки и требования, которых нет в контексте.\n"
                             "Строго запрещено объединять информацию из разных разделов или подпунктов в один шаг.\n"
                             "Не пропускай разделы из контекста — включай все: основные шаги, исправления ошибок, примечания, подсказки.\n"
+                            "Блок 'Наиболее релевантные фрагменты' — это подсказка для ответа; если там есть прямой ответ, используй его и не отвечай 'Информация в документах не найдена'.\n"
                             "Если в контексте нет прямого ответа на вопрос, ответь ровно одной фразой: Информация в документах не найдена.\n"
                             "Оформляй ответ единым нумерованным списком со сквозной нумерацией (1. 2. 3. ...), каждый шаг — отдельным пунктом. Не перезапускай нумерацию.\n"
                             "Если спрашивают 'какие бывают', 'виды', 'типы', 'перечислить' — дай нумерованный список элементов; если спрашивают 'как сделать', 'порядок', 'процесс' — дай пошаговую инструкцию. Включай все значимые шаги из контекста, в том числе подсказки, исправления ошибок и важные замечания.\n"
@@ -2094,7 +2176,12 @@ async def ask(req: AskRequest, request: Request):
                     },
                     {
                         "role": "user",
-                        "content": f"Контекст:\n\n{context}\n\nВопрос: {req.question}",
+                        "content": (
+                            f"Наиболее релевантные фрагменты:\n\n"
+                            f"{relevant_context or 'Нет выделенных фрагментов.'}\n\n"
+                            f"Полный контекст:\n\n{context}\n\n"
+                            f"Вопрос: {req.question}"
+                        ),
                     },
                 ],
                 max_tokens=1500,
