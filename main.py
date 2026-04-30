@@ -1173,6 +1173,33 @@ def _most_relevant_fragments(
     return fragments
 
 
+def _qualify_image_markers(text: str, filename: str) -> str:
+    marker_re = re.compile(r"\[Рисунок\s+(\d+):\s+([^\]]+)\]")
+
+    def repl(match: re.Match) -> str:
+        return f"[Рисунок {match.group(1)}: {filename}::{match.group(2)}]"
+
+    return marker_re.sub(repl, text)
+
+
+def _replace_image_markers_with_urls(
+    answer: str,
+    image_urls: dict[str, str],
+) -> tuple[str, dict[str, str]]:
+    marker_re = re.compile(r"\[Рисунок\s+\d+:\s+[^\]]+\]")
+    used: dict[str, str] = {}
+
+    def repl(match: re.Match) -> str:
+        marker = match.group(0)
+        url = image_urls.get(marker)
+        if not url:
+            return ""
+        used[marker] = url
+        return f"\n{url}"
+
+    return marker_re.sub(repl, answer), used
+
+
 # ── Форматирование ответа в HTML ─────────────────────────────────────────────
 
 def _answer_to_html(
@@ -2149,11 +2176,16 @@ async def ask(req: AskRequest, request: Request):
             all_docs = docs
             all_metas = metas
 
+        context_docs = [
+            _qualify_image_markers(d, m["filename"])
+            for d, m in zip(all_docs, all_metas)
+        ]
+
         context = "\n\n".join(
             f"[CHUNK {i} | {m['filename']}]\n{d}"
-            for i, (d, m) in enumerate(zip(all_docs, all_metas))
+            for i, (d, m) in enumerate(zip(context_docs, all_metas))
         )
-        relevant_fragments = _most_relevant_fragments(req.question, all_docs, all_metas)
+        relevant_fragments = _most_relevant_fragments(req.question, context_docs, all_metas)
         relevant_context = "\n".join(
             f"{i}. {fragment}"
             for i, fragment in enumerate(relevant_fragments, start=1)
@@ -2175,6 +2207,9 @@ async def ask(req: AskRequest, request: Request):
                             "Блок 'Наиболее релевантные фрагменты' — это подсказка для ответа; если там есть прямой ответ, используй его и не отвечай 'Информация в документах не найдена'.\n"
                             "Если в контексте нет прямого ответа на вопрос, ответь ровно одной фразой: Информация в документах не найдена.\n"
                             "Оформляй ответ единым нумерованным списком со сквозной нумерацией (1. 2. 3. ...), каждый шаг — отдельным пунктом. Не перезапускай нумерацию.\n"
+                            "Если рядом с использованным текстом в контексте есть маркер вида [Рисунок N: файл::img_NNN.png], скопируй этот маркер отдельной строкой сразу после соответствующего пункта ответа.\n"
+                            "Не добавляй маркеры картинок из других пунктов, других разделов или просто похожих документов.\n"
+                            "Не выдумывай маркеры картинок: можно использовать только маркеры, которые дословно есть в контексте.\n"
                             "Если спрашивают 'какие бывают', 'виды', 'типы', 'перечислить' — дай нумерованный список элементов; если спрашивают 'как сделать', 'порядок', 'процесс' — дай пошаговую инструкцию. Включай все значимые шаги из контекста, в том числе подсказки, исправления ошибок и важные замечания.\n"
                             "Отвечай по существу, с небольшим введением.\n"
                             "Не пиши фразы вроде: 'Давайте разберем', 'Вот пошаговая инструкция', 'Based on the provided documentation', 'Okay'.\n"
@@ -2216,9 +2251,8 @@ async def ask(req: AskRequest, request: Request):
 
         base = _public_base_url(request)
 
-        # Собираем картинки из всех релевантных чанков. Конкретная картинка
-        # будет вставлена только если локальный текст прямо перед ней уверенно
-        # совпадает с пунктом ответа.
+        # Собираем URL картинок по уникальным маркерам, которые LLM видела
+        # в контексте и может дословно скопировать в ответ.
         image_urls: dict[str, str] = {}
         img_marker_re = re.compile(r"\[Рисунок (\d+): ([^\]]+)\]")
 
@@ -2234,40 +2268,39 @@ async def ask(req: AskRequest, request: Request):
         sources = sorted(_all_sources, key=lambda fn: _fname_relevance.get(fn, 0), reverse=True)
         download_urls = {s: f"{base}/files/{s}" for s in sources}
 
-        # Собираем image-чанки из расширенного контекста. Ключ включает имя файла,
-        # потому что одинаковые маркеры [Рисунок 1: img_001.png] есть в разных
-        # документах.
-        _img_chunks: list[str] = []
-        _img_metas: list[dict] = []
         _img_chunk_counts: dict[str, int] = {}
+        _simple_image_urls: dict[str, str] = {}
+        _simple_marker_counts: dict[str, int] = {}
         for doc_text, meta in zip(all_docs, all_metas):
             matches = list(img_marker_re.finditer(doc_text))
             if not matches:
                 continue
-            _img_chunks.append(doc_text)
-            _img_metas.append(meta)
             filename = meta["filename"]
             stem = Path(filename).stem
             _img_chunk_counts[filename] = _img_chunk_counts.get(filename, 0) + 1
             for match in matches:
                 img_name = match.group(2)
-                marker = match.group(0)
-                image_urls[f"{filename}::{marker}"] = (
-                    f"{base}/files/{stem}_images/{img_name}"
+                url = f"{base}/files/{stem}_images/{img_name}"
+                marker = f"[Рисунок {match.group(1)}: {filename}::{img_name}]"
+                simple_marker = match.group(0)
+                image_urls[marker] = url
+                _simple_image_urls[simple_marker] = url
+                _simple_marker_counts[simple_marker] = (
+                    _simple_marker_counts.get(simple_marker, 0) + 1
                 )
+
+        for marker, count in _simple_marker_counts.items():
+            if count == 1:
+                image_urls[marker] = _simple_image_urls[marker]
 
         log.info("Image candidates: %s", _img_chunk_counts)
 
-        # Привязываем иллюстрации к пунктам ответа только по локальному тексту
-        # перед маркером картинки.
+        # Не угадываем картинки по словам. Используем только маркеры, которые
+        # LLM дословно взяла из контекста.
         if image_urls and answer != _not_found:
-            answer = _attach_images_to_answer(answer, _img_chunks, _img_metas, image_urls)
-        if image_urls:
-            image_urls = {
-                marker: url
-                for marker, url in image_urls.items()
-                if url in answer
-            }
+            answer, image_urls = _replace_image_markers_with_urls(answer, image_urls)
+        else:
+            image_urls = {}
 
         answer_html = _answer_to_html(answer, image_urls, download_urls)
 
