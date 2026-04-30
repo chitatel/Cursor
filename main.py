@@ -25,6 +25,7 @@ import os
 import re
 import json
 import math
+import time
 import shutil
 import logging
 import asyncio
@@ -71,6 +72,7 @@ STORAGE_DIR = Path(_config_value("STORAGE_DIR"))
 if not STORAGE_DIR.is_absolute():
     STORAGE_DIR = (APP_DIR / STORAGE_DIR).resolve()
 FILES_DIR = STORAGE_DIR / "files"
+ASK_LOG_FILE = STORAGE_DIR / "ask.log.jsonl"
 PREPARED_DIR = STORAGE_DIR / "prepared"
 INDEX_FILE = STORAGE_DIR / "index.json"
 FAISS_INDEX_FILE = STORAGE_DIR / "index.faiss"
@@ -93,6 +95,8 @@ OPENWEBUI_PASSWORD = _config_value("OPENWEBUI_PASSWORD")
 
 # Размер батча для эмбеддингов при индексировании
 EMBED_BATCH_SIZE = int(CONFIG.get("EMBED_BATCH_SIZE", 32))
+# Максимум записей, которое отдаёт GET /logs за один запрос
+LOG_MAX_RETURN = int(CONFIG.get("LOG_MAX_RETURN", 5000))
 # Включить query rewrite (добавляет 1 LLM-вызов, может улучшить recall)
 QUERY_REWRITE_ENABLED = bool(CONFIG.get("QUERY_REWRITE_ENABLED", False))
 # Вес BM25 при RRF fusion (0.0 — только вектор, 1.0 — только BM25)
@@ -119,6 +123,7 @@ _indexing: dict[str, dict] = {}
 _indexing_locks: dict[str, asyncio.Lock] = {}
 _auth_token: Optional[str] = None
 _auth_lock = asyncio.Lock()
+_ask_log_lock = asyncio.Lock()
 
 
 # ── Хранилище записей ────────────────────────────────────────────────────────
@@ -157,6 +162,54 @@ async def _get_records() -> list[dict]:
     """Потокобезопасное получение записей."""
     async with _records_lock:
         return list(_load_records_sync())
+
+
+async def _log_ask(entry: dict) -> None:
+    """
+    Дописывает строку в JSON Lines лог /ask.  Запись атомарна на уровне строки
+    благодаря O_APPEND; lock защищает от перемешивания с одновременных корутин
+    в рамках одного воркера.
+    """
+    line = json.dumps(entry, ensure_ascii=False) + "\n"
+    try:
+        async with _ask_log_lock:
+            async with aiofiles.open(ASK_LOG_FILE, "a", encoding="utf-8") as f:
+                await f.write(line)
+    except Exception as e:
+        log.warning("Failed to write ask log: %s", e)
+
+
+async def _read_ask_log(
+    limit: int,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+) -> list[dict]:
+    """
+    Читает JSONL-лог и возвращает последние `limit` записей, новые сверху.
+    date_from/date_to сравниваются как ISO-строки (лексикографически — это
+    корректно для ISO-timestamps).
+    """
+    if not ASK_LOG_FILE.exists():
+        return []
+    entries: list[dict] = []
+    async with _ask_log_lock:
+        async with aiofiles.open(ASK_LOG_FILE, "r", encoding="utf-8") as f:
+            async for raw in f:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    item = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                ts = item.get("timestamp", "")
+                if date_from and ts < date_from:
+                    continue
+                if date_to and ts > date_to:
+                    continue
+                entries.append(item)
+    entries.reverse()
+    return entries[:limit]
 
 
 def _save_records_sync(records: list[dict]):
@@ -1671,6 +1724,24 @@ async def list_categories():
     return await _list_categories()
 
 
+@app.get("/logs")
+async def get_logs(
+    limit: int = 200,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+):
+    """
+    Возвращает последние записи лога /ask, новые сверху.
+
+    - limit: 1..LOG_MAX_RETURN
+    - date_from / date_to: ISO-строка ("2026-04-30" или "2026-04-30T12:00:00Z").
+      Сравнение лексикографическое — для ISO-формата это эквивалентно сравнению дат.
+    """
+    if not isinstance(limit, int) or limit < 1 or limit > LOG_MAX_RETURN:
+        raise HTTPException(400, f"limit must be 1..{LOG_MAX_RETURN}, got: {limit}")
+    return await _read_ask_log(limit=limit, date_from=date_from, date_to=date_to)
+
+
 @app.post("/documents", response_model=UploadResponse, status_code=202)
 async def upload_document(
     background_tasks: BackgroundTasks,
@@ -1910,197 +1981,230 @@ async def delete_document(filename: str):
 
 @app.post("/ask", response_model=AskResponse)
 async def ask(req: AskRequest, request: Request):
-    if await _chunk_count() == 0:
-        raise HTTPException(503, "Index is empty. Upload documents first via POST /documents")
-
-    raw_top_k = req.top_k
-    if raw_top_k is not None and (not isinstance(raw_top_k, int) or raw_top_k < 1):
-        raise HTTPException(400, f"top_k must be a positive integer, got: {raw_top_k}")
-    top_k = max(1, raw_top_k or TOP_K)
-
-    rewritten = await _rewrite_query(req.question)
-    log.info("Query rewrite: %r → %r", req.question, rewritten)
-
-    try:
-        q_emb = await _embed(rewritten)
-        if q_emb is None:
-            raise ValueError("embed returned None")
-    except Exception as e:
-        raise HTTPException(502, f"Embedding API error: {e}")
-
-    category = _normalize_category(req.category)
-    results = await _search_records(rewritten, _normalize_embedding(q_emb), top_k, category=category)
-
-    docs = results["documents"][0]
-    metas = results["metadatas"][0]
-    distances = results["distances"][0]
-
-    _not_found = "Информация в документах не найдена."
-    _not_found_html = _answer_to_html(_not_found, {})
-
-    if not docs:
-        return AskResponse(
-            answer=_not_found,
-            answer_html=_not_found_html,
-            sources=[],
-            chunks_used=0,
-            download_urls={},
-            image_urls={},
-            raw_chunks=[],
-            rewritten_query=rewritten,
-        )
-
-    best_sim = 1 - distances[0]
-    log.info("Best similarity: %.3f", best_sim)
-    if best_sim < SIM_THRESHOLD:
-        return AskResponse(
-            answer=_not_found,
-            answer_html=_not_found_html,
-            sources=[],
-            chunks_used=0,
-            download_urls={},
-            image_urls={},
-            raw_chunks=[],
-            rewritten_query=rewritten,
-        )
-
-    # Расширяем контекст соседними чанками (document-aware)
-    records = await _get_records()
-    all_docs, all_metas = _build_document_aware_context(
-        results["ids"][0], records, budget=top_k * 2,
-    )
-
-    if not all_docs:
-        all_docs = docs
-        all_metas = metas
-
-    context = "\n\n".join(
-        f"[CHUNK {i} | {m['filename']}]\n{d}"
-        for i, (d, m) in enumerate(zip(all_docs, all_metas))
-    )
-    _all_sources = list(dict.fromkeys(m["filename"] for m in all_metas))
+    log_entry: dict = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "question": req.question,
+        "category": req.category,
+        "top_k": req.top_k,
+        "best_similarity": None,
+        "sources": [],
+        "chunks_used": 0,
+        "rewritten_query": None,
+        "answer": None,
+        "error": None,
+        "duration_ms": None,
+    }
+    started_mono = time.monotonic()
 
     try:
-        answer = await _chat(
-            [
-                {
-                    "role": "system",
-                    "content": (
-                        "Отвечай только на русском языке.\n"
-                        "Контекст ниже — единственный источник правды.\n"
-                        "Строго следуй порядку изложения в контексте — не переставляй шаги местами и не начинай с середины.\n"
-                        "Строго запрещено придумывать шаги, роли, ограничения, числа, лимиты, сроки и требования, которых нет в контексте.\n"
-                        "Строго запрещено объединять информацию из разных разделов или подпунктов в один шаг.\n"
-                        "Не пропускай разделы из контекста — включай все: основные шаги, исправления ошибок, примечания, подсказки.\n"
-                        "Если в контексте нет прямого ответа на вопрос, ответь ровно одной фразой: Информация в документах не найдена.\n"
-                        "Оформляй ответ единым нумерованным списком со сквозной нумерацией (1. 2. 3. ...), каждый шаг — отдельным пунктом. Не перезапускай нумерацию.\n"
-                        "Если спрашивают 'какие бывают', 'виды', 'типы', 'перечислить' — дай нумерованный список элементов; если спрашивают 'как сделать', 'порядок', 'процесс' — дай пошаговую инструкцию. Включай все значимые шаги из контекста, в том числе подсказки, исправления ошибок и важные замечания.\n"
-                        "Отвечай по существу, с небольшим введением.\n"
-                        "Не пиши фразы вроде: 'Давайте разберем', 'Вот пошаговая инструкция', 'Based on the provided documentation', 'Okay'.\n"
-                        "Не переводи термины на английский и не смешивай языки.\n"
-                        "Если есть сомнение, лучше ответь: Информация в документах не найдена."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": f"Контекст:\n\n{context}\n\nВопрос: {req.question}",
-                },
-            ],
-            max_tokens=1500,
+        if await _chunk_count() == 0:
+            raise HTTPException(503, "Index is empty. Upload documents first via POST /documents")
+
+        raw_top_k = req.top_k
+        if raw_top_k is not None and (not isinstance(raw_top_k, int) or raw_top_k < 1):
+            raise HTTPException(400, f"top_k must be a positive integer, got: {raw_top_k}")
+        top_k = max(1, raw_top_k or TOP_K)
+
+        rewritten = await _rewrite_query(req.question)
+        log.info("Query rewrite: %r → %r", req.question, rewritten)
+        log_entry["rewritten_query"] = rewritten
+
+        try:
+            q_emb = await _embed(rewritten)
+            if q_emb is None:
+                raise ValueError("embed returned None")
+        except Exception as e:
+            raise HTTPException(502, f"Embedding API error: {e}")
+
+        category = _normalize_category(req.category)
+        results = await _search_records(rewritten, _normalize_embedding(q_emb), top_k, category=category)
+
+        docs = results["documents"][0]
+        metas = results["metadatas"][0]
+        distances = results["distances"][0]
+
+        _not_found = "Информация в документах не найдена."
+        _not_found_html = _answer_to_html(_not_found, {})
+
+        if not docs:
+            log_entry["answer"] = _not_found
+            return AskResponse(
+                answer=_not_found,
+                answer_html=_not_found_html,
+                sources=[],
+                chunks_used=0,
+                download_urls={},
+                image_urls={},
+                raw_chunks=[],
+                rewritten_query=rewritten,
+            )
+
+        best_sim = 1 - distances[0]
+        log.info("Best similarity: %.3f", best_sim)
+        log_entry["best_similarity"] = round(float(best_sim), 4)
+        if best_sim < SIM_THRESHOLD:
+            log_entry["answer"] = _not_found
+            return AskResponse(
+                answer=_not_found,
+                answer_html=_not_found_html,
+                sources=[],
+                chunks_used=0,
+                download_urls={},
+                image_urls={},
+                raw_chunks=[],
+                rewritten_query=rewritten,
+            )
+
+        # Расширяем контекст соседними чанками (document-aware)
+        records = await _get_records()
+        all_docs, all_metas = _build_document_aware_context(
+            results["ids"][0], records, budget=top_k * 2,
         )
-    except Exception as e:
-        raise HTTPException(502, f"Chat API error: {e}")
 
-    log.info("Raw answer: %r", answer[:200])
+        if not all_docs:
+            all_docs = docs
+            all_metas = metas
 
-    # Убираем блок рассуждений <think>...</think> (deepseek-r1 и подобные)
-    answer = re.sub(r"<think>.*?</think>", "", answer, flags=re.DOTALL).strip()
-    # Убираем маркеры чанков [CHUNK N] / (CHUNK N), которые LLM может скопировать из контекста
-    answer = re.sub(r"\s*[\(\[]\s*CHUNK\s*\d+\s*[\)\]]", "", answer).strip()
+        context = "\n\n".join(
+            f"[CHUNK {i} | {m['filename']}]\n{d}"
+            for i, (d, m) in enumerate(zip(all_docs, all_metas))
+        )
+        _all_sources = list(dict.fromkeys(m["filename"] for m in all_metas))
 
-    answer_clean = answer.strip()
-    for quote in ['"', "'", "«", "»"]:
-        answer_clean = answer_clean.strip(quote)
-    answer = answer_clean.strip().replace("\\n", "\n")
+        try:
+            answer = await _chat(
+                [
+                    {
+                        "role": "system",
+                        "content": (
+                            "Отвечай только на русском языке.\n"
+                            "Контекст ниже — единственный источник правды.\n"
+                            "Строго следуй порядку изложения в контексте — не переставляй шаги местами и не начинай с середины.\n"
+                            "Строго запрещено придумывать шаги, роли, ограничения, числа, лимиты, сроки и требования, которых нет в контексте.\n"
+                            "Строго запрещено объединять информацию из разных разделов или подпунктов в один шаг.\n"
+                            "Не пропускай разделы из контекста — включай все: основные шаги, исправления ошибок, примечания, подсказки.\n"
+                            "Если в контексте нет прямого ответа на вопрос, ответь ровно одной фразой: Информация в документах не найдена.\n"
+                            "Оформляй ответ единым нумерованным списком со сквозной нумерацией (1. 2. 3. ...), каждый шаг — отдельным пунктом. Не перезапускай нумерацию.\n"
+                            "Если спрашивают 'какие бывают', 'виды', 'типы', 'перечислить' — дай нумерованный список элементов; если спрашивают 'как сделать', 'порядок', 'процесс' — дай пошаговую инструкцию. Включай все значимые шаги из контекста, в том числе подсказки, исправления ошибок и важные замечания.\n"
+                            "Отвечай по существу, с небольшим введением.\n"
+                            "Не пиши фразы вроде: 'Давайте разберем', 'Вот пошаговая инструкция', 'Based on the provided documentation', 'Okay'.\n"
+                            "Не переводи термины на английский и не смешивай языки.\n"
+                            "Если есть сомнение, лучше ответь: Информация в документах не найдена."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": f"Контекст:\n\n{context}\n\nВопрос: {req.question}",
+                    },
+                ],
+                max_tokens=1500,
+            )
+        except Exception as e:
+            raise HTTPException(502, f"Chat API error: {e}")
 
-    if answer != "Информация в документах не найдена.":
-        if not _is_faithful(answer, context):
-            log.warning("Faithfulness check failed — suppressing answer")
-            answer = "Информация в документах не найдена."
+        log.info("Raw answer: %r", answer[:200])
 
-    base = _public_base_url(request)
+        # Убираем блок рассуждений <think>...</think> (deepseek-r1 и подобные)
+        answer = re.sub(r"<think>.*?</think>", "", answer, flags=re.DOTALL).strip()
+        # Убираем маркеры чанков [CHUNK N] / (CHUNK N), которые LLM может скопировать из контекста
+        answer = re.sub(r"\s*[\(\[]\s*CHUNK\s*\d+\s*[\)\]]", "", answer).strip()
 
-    # Собираем ссылки на изображения СТРОГО из одного документа.
-    # Приоритет: документ, чьё имя файла совпадает с темой вопроса.
-    # Фоллбэк: первый чанк с картинками (самый релевантный).
-    image_urls: dict[str, str] = {}
-    img_marker_re = re.compile(r"\[Рисунок (\d+): ([^\]]+)\]")
+        answer_clean = answer.strip()
+        for quote in ['"', "'", "«", "»"]:
+            answer_clean = answer_clean.strip(quote)
+        answer = answer_clean.strip().replace("\\n", "\n")
 
-    # Корни слов вопроса (первые 5 букв слов длиной ≥5)
-    _q_roots = {w[:5] for w in re.findall(r"[а-яёa-z]{5,}", req.question.lower())}
+        if answer != "Информация в документах не найдена.":
+            if not _is_faithful(answer, context):
+                log.warning("Faithfulness check failed — suppressing answer")
+                answer = "Информация в документах не найдена."
 
-    # Ищем документ с картинками, чьё имя файла лучше всего совпадает с вопросом
-    _img_source_file = None
-    _best_fname_score = 0
-    _img_chunk_counts: dict[str, int] = {}  # файл → кол-во чанков с картинками
-    for doc_text, meta in zip(docs, metas):
-        fn = meta["filename"]
-        if img_marker_re.search(doc_text):
-            _img_chunk_counts[fn] = _img_chunk_counts.get(fn, 0) + 1
+        base = _public_base_url(request)
+
+        # Собираем ссылки на изображения СТРОГО из одного документа.
+        # Приоритет: документ, чьё имя файла совпадает с темой вопроса.
+        # Фоллбэк: первый чанк с картинками (самый релевантный).
+        image_urls: dict[str, str] = {}
+        img_marker_re = re.compile(r"\[Рисунок (\d+): ([^\]]+)\]")
+
+        # Корни слов вопроса (первые 5 букв слов длиной ≥5)
+        _q_roots = {w[:5] for w in re.findall(r"[а-яёa-z]{5,}", req.question.lower())}
+
+        # Ищем документ с картинками, чьё имя файла лучше всего совпадает с вопросом
+        _img_source_file = None
+        _best_fname_score = 0
+        _img_chunk_counts: dict[str, int] = {}  # файл → кол-во чанков с картинками
+        for doc_text, meta in zip(docs, metas):
+            fn = meta["filename"]
+            if img_marker_re.search(doc_text):
+                _img_chunk_counts[fn] = _img_chunk_counts.get(fn, 0) + 1
+                fn_roots = {w[:5] for w in re.findall(r"[а-яёa-z]{5,}",
+                            fn.replace("_", " ").replace("-", " ").lower())}
+                score = len(_q_roots & fn_roots)
+                if score > _best_fname_score:
+                    _best_fname_score = score
+                    _img_source_file = fn
+
+        # Фоллбэк: документ с наибольшим числом чанков с картинками
+        if not _img_source_file and _img_chunk_counts:
+            _img_source_file = max(_img_chunk_counts, key=_img_chunk_counts.get)
+
+        log.info("Image source: %s (fname_score=%d, img_chunks=%s)",
+                 _img_source_file, _best_fname_score, _img_chunk_counts)
+
+        # Источники: самый релевантный документ (по совпадению имени с вопросом) первым
+        _fname_relevance: dict[str, int] = {}
+        for fn in _all_sources:
             fn_roots = {w[:5] for w in re.findall(r"[а-яёa-z]{5,}",
                         fn.replace("_", " ").replace("-", " ").lower())}
-            score = len(_q_roots & fn_roots)
-            if score > _best_fname_score:
-                _best_fname_score = score
-                _img_source_file = fn
+            _fname_relevance[fn] = len(_q_roots & fn_roots)
+        sources = sorted(_all_sources, key=lambda fn: _fname_relevance.get(fn, 0), reverse=True)
+        download_urls = {s: f"{base}/files/{s}" for s in sources}
 
-    # Фоллбэк: документ с наибольшим числом чанков с картинками
-    if not _img_source_file and _img_chunk_counts:
-        _img_source_file = max(_img_chunk_counts, key=_img_chunk_counts.get)
+        # Собираем чанки и картинки из расширенного контекста (all_docs),
+        # но только из файла-источника картинок
+        _img_chunks: list[str] = []
+        _img_metas: list[dict] = []
+        if _img_source_file:
+            for doc_text, meta in zip(all_docs, all_metas):
+                if meta["filename"] == _img_source_file:
+                    _img_chunks.append(doc_text)
+                    _img_metas.append(meta)
+                    for match in img_marker_re.finditer(doc_text):
+                        img_name = match.group(2)
+                        marker = match.group(0)
+                        if marker not in image_urls:
+                            stem = Path(meta["filename"]).stem
+                            image_urls[marker] = (
+                                f"{base}/files/{stem}_images/{img_name}"
+                            )
 
-    log.info("Image source: %s (fname_score=%d, img_chunks=%s)",
-             _img_source_file, _best_fname_score, _img_chunk_counts)
+        # Привязываем иллюстрации к пунктам ответа — строго из одного документа
+        if image_urls and answer != _not_found:
+            answer = _attach_images_to_answer(answer, _img_chunks, _img_metas, image_urls)
 
-    # Источники: самый релевантный документ (по совпадению имени с вопросом) первым
-    _fname_relevance: dict[str, int] = {}
-    for fn in _all_sources:
-        fn_roots = {w[:5] for w in re.findall(r"[а-яёa-z]{5,}",
-                    fn.replace("_", " ").replace("-", " ").lower())}
-        _fname_relevance[fn] = len(_q_roots & fn_roots)
-    sources = sorted(_all_sources, key=lambda fn: _fname_relevance.get(fn, 0), reverse=True)
-    download_urls = {s: f"{base}/files/{s}" for s in sources}
+        answer_html = _answer_to_html(answer, image_urls, download_urls)
 
-    # Собираем чанки и картинки из расширенного контекста (all_docs),
-    # но только из файла-источника картинок
-    _img_chunks: list[str] = []
-    _img_metas: list[dict] = []
-    if _img_source_file:
-        for doc_text, meta in zip(all_docs, all_metas):
-            if meta["filename"] == _img_source_file:
-                _img_chunks.append(doc_text)
-                _img_metas.append(meta)
-                for match in img_marker_re.finditer(doc_text):
-                    img_name = match.group(2)
-                    marker = match.group(0)
-                    if marker not in image_urls:
-                        stem = Path(meta["filename"]).stem
-                        image_urls[marker] = (
-                            f"{base}/files/{stem}_images/{img_name}"
-                        )
+        log_entry["answer"] = answer
+        log_entry["sources"] = sources
+        log_entry["chunks_used"] = len(all_docs)
 
-    # Привязываем иллюстрации к пунктам ответа — строго из одного документа
-    if image_urls and answer != _not_found:
-        answer = _attach_images_to_answer(answer, _img_chunks, _img_metas, image_urls)
-
-    answer_html = _answer_to_html(answer, image_urls, download_urls)
-
-    return AskResponse(
-        answer=answer,
-        answer_html=answer_html,
-        sources=sources,
-        chunks_used=len(all_docs),
-        download_urls=download_urls,
-        image_urls=image_urls,
-        raw_chunks=all_docs[:5],
-        rewritten_query=rewritten,
-    )
+        return AskResponse(
+            answer=answer,
+            answer_html=answer_html,
+            sources=sources,
+            chunks_used=len(all_docs),
+            download_urls=download_urls,
+            image_urls=image_urls,
+            raw_chunks=all_docs[:5],
+            rewritten_query=rewritten,
+        )
+    except HTTPException as e:
+        log_entry["error"] = f"HTTP {e.status_code}: {e.detail}"
+        raise
+    except Exception as e:
+        log_entry["error"] = repr(e)
+        raise
+    finally:
+        log_entry["duration_ms"] = int((time.monotonic() - started_mono) * 1000)
+        await _log_ask(log_entry)

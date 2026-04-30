@@ -1,7 +1,9 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python3 -c \"import ast; ast.parse\\(open\\('/Users/chitatelsnov/Documents/AI/Cursor/main.py'\\).read\\(\\)\\); print\\('Syntax OK'\\)\")"
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('/Users/chitatelsnov/Documents/AI/Cursor/main.py'\\).read\\(\\)\\); print\\('Syntax OK'\\)\")",
+      "Bash(awk '/^@app.post\\\\\\(\"\\\\/ask\"/,/^@app\\\\.|^def [a-zA-Z]|^async def [a-zA-Z][a-zA-Z_]*\\\\\\(/' /Users/chitatelsnov/Documents/AI/Cursor/main.py)",
+      "Bash(python3)"
     ]
   }
 }
