@@ -1277,13 +1277,14 @@ def _attach_images_to_answer(
 
     def bag(text: str) -> set[str]:
         cleaned = img_marker_re.sub("", text)
-        return set(re.findall(r"[А-Яа-яЁёA-Za-z0-9-]{4,}", cleaned.lower()))
+        return _query_terms(cleaned)
 
     # Группируем маркеры: если между двумя маркерами нет значимого текста
     # (менее 3 слов), они образуют одну группу
     # group = (preceding_bag, [url1, url2, ...])
     groups: list[tuple[set[str], list[str]]] = []
-    for chunk_text in chunks:
+    for chunk_text, meta in zip(chunks, chunk_metas):
+        filename = meta.get("filename", "")
         markers_in_chunk = list(img_marker_re.finditer(chunk_text))
         if not markers_in_chunk:
             continue
@@ -1292,15 +1293,18 @@ def _attach_images_to_answer(
         current_group_preceding: set[str] = set()
 
         for i, match in enumerate(markers_in_chunk):
-            url = image_urls.get(match.group(0))
+            marker = match.group(0)
+            url = image_urls.get(f"{filename}::{marker}") or image_urls.get(marker)
             if not url:
                 continue
 
-            start = markers_in_chunk[i - 1].end() if i > 0 else 0
+            previous_end = markers_in_chunk[i - 1].end() if i > 0 else 0
+            start = max(previous_end, match.start() - 450)
             preceding_text = chunk_text[start:match.start()]
             preceding_words = bag(preceding_text)
+            separator_words = bag(chunk_text[previous_end:match.start()]) if i > 0 else preceding_words
 
-            if i == 0 or len(preceding_words) >= 1:
+            if i == 0 or len(separator_words) >= 1:
                 # Начало новой группы: первый маркер или есть хоть одно слово перед ним
                 if current_group_urls:
                     groups.append((current_group_preceding, current_group_urls))
@@ -1335,15 +1339,19 @@ def _attach_images_to_answer(
 
         best_idx = -1
         best_score = 0
+        best_coverage = 0.0
         for idx, (preceding_bag, urls) in enumerate(groups):
             if idx in used_groups:
                 continue
-            score = len(point_bag & preceding_bag)
-            if score > best_score:
+            overlap = point_bag & preceding_bag
+            score = len(overlap)
+            coverage = score / max(len(point_bag), 1)
+            if score > best_score or (score == best_score and coverage > best_coverage):
                 best_score = score
+                best_coverage = coverage
                 best_idx = idx
 
-        if best_idx >= 0 and best_score >= 2:
+        if best_idx >= 0 and best_score >= 2 and best_coverage >= 0.25:
             used_groups.add(best_idx)
             all_urls = "\n".join(groups[best_idx][1])
             result_parts.append(f"{point}\n{all_urls}")
@@ -2208,91 +2216,14 @@ async def ask(req: AskRequest, request: Request):
 
         base = _public_base_url(request)
 
-        # Собираем ссылки на изображения СТРОГО из одного документа.
-        # Главный критерий: текстовая близость чанка с картинками к уже
-        # сформированному ответу и вопросу. Имя файла используется только
-        # как последний fallback, иначе похожие названия перетягивают картинки
-        # из смыслово другого документа.
+        # Собираем картинки из всех релевантных чанков. Конкретная картинка
+        # будет вставлена только если локальный текст прямо перед ней уверенно
+        # совпадает с пунктом ответа.
         image_urls: dict[str, str] = {}
         img_marker_re = re.compile(r"\[Рисунок (\d+): ([^\]]+)\]")
 
         # Корни слов вопроса (первые 5 букв слов длиной ≥5)
         _q_roots = {w[:5] for w in re.findall(r"[а-яёa-z]{5,}", req.question.lower())}
-        _question_terms = _query_terms(req.question)
-        _answer_terms = _query_terms(answer)
-
-        # Ищем документ с картинками, чей текст рядом с картинками лучше всего
-        # совпадает с ответом/вопросом.
-        _img_source_file = None
-        _best_image_score = 0.0
-        _best_text_score = 0
-        _best_fname_score = 0
-        _img_chunk_counts: dict[str, int] = {}  # файл → кол-во чанков с картинками
-        _img_text_scores: dict[str, int] = {}
-        _img_fname_scores: dict[str, int] = {}
-
-        for doc_rank, (doc_text, meta) in enumerate(zip(all_docs, all_metas)):
-            fn = meta["filename"]
-            markers = list(img_marker_re.finditer(doc_text))
-            if not markers:
-                continue
-
-            _img_chunk_counts[fn] = _img_chunk_counts.get(fn, 0) + 1
-
-            chunk_terms = _sentence_terms(img_marker_re.sub(" ", doc_text))
-            chunk_score = (
-                len(_answer_terms & chunk_terms) * 3
-                + len(_question_terms & chunk_terms)
-            )
-
-            marker_score = 0
-            for marker in markers:
-                start = max(0, marker.start() - 700)
-                end = min(len(doc_text), marker.end() + 300)
-                marker_terms = _sentence_terms(
-                    img_marker_re.sub(" ", doc_text[start:end])
-                )
-                marker_score = max(
-                    marker_score,
-                    len(_answer_terms & marker_terms) * 4
-                    + len(_question_terms & marker_terms) * 2,
-                )
-
-            text_score = max(chunk_score, marker_score)
-            score = text_score + 1 / (doc_rank + 1)
-            if text_score > _img_text_scores.get(fn, 0):
-                _img_text_scores[fn] = text_score
-
-            fn_roots = {w[:5] for w in re.findall(r"[а-яёa-z]{5,}",
-                        fn.replace("_", " ").replace("-", " ").lower())}
-            _img_fname_scores[fn] = len(_q_roots & fn_roots)
-
-            if text_score > 0 and score > _best_image_score:
-                _best_image_score = score
-                _best_text_score = text_score
-                _img_source_file = fn
-
-        # Если текст не дал уверенного совпадения, используем старый fallback по имени.
-        if not _img_source_file and _img_chunk_counts:
-            for fn in _img_chunk_counts:
-                fname_score = _img_fname_scores.get(fn, 0)
-                if fname_score > _best_fname_score:
-                    _best_fname_score = fname_score
-                    _img_source_file = fn
-
-        # Последний фоллбэк: документ с наибольшим числом чанков с картинками.
-        if not _img_source_file and _img_chunk_counts:
-            _img_source_file = max(_img_chunk_counts, key=_img_chunk_counts.get)
-
-        log.info(
-            "Image source: %s (text_score=%d, rank_score=%.2f, text_scores=%s, fname_scores=%s, img_chunks=%s)",
-            _img_source_file,
-            _best_text_score,
-            _best_image_score,
-            _img_text_scores,
-            _img_fname_scores,
-            _img_chunk_counts,
-        )
 
         # Источники: самый релевантный документ (по совпадению имени с вопросом) первым
         _fname_relevance: dict[str, int] = {}
@@ -2303,27 +2234,40 @@ async def ask(req: AskRequest, request: Request):
         sources = sorted(_all_sources, key=lambda fn: _fname_relevance.get(fn, 0), reverse=True)
         download_urls = {s: f"{base}/files/{s}" for s in sources}
 
-        # Собираем чанки и картинки из расширенного контекста (all_docs),
-        # но только из файла-источника картинок
+        # Собираем image-чанки из расширенного контекста. Ключ включает имя файла,
+        # потому что одинаковые маркеры [Рисунок 1: img_001.png] есть в разных
+        # документах.
         _img_chunks: list[str] = []
         _img_metas: list[dict] = []
-        if _img_source_file:
-            for doc_text, meta in zip(all_docs, all_metas):
-                if meta["filename"] == _img_source_file:
-                    _img_chunks.append(doc_text)
-                    _img_metas.append(meta)
-                    for match in img_marker_re.finditer(doc_text):
-                        img_name = match.group(2)
-                        marker = match.group(0)
-                        if marker not in image_urls:
-                            stem = Path(meta["filename"]).stem
-                            image_urls[marker] = (
-                                f"{base}/files/{stem}_images/{img_name}"
-                            )
+        _img_chunk_counts: dict[str, int] = {}
+        for doc_text, meta in zip(all_docs, all_metas):
+            matches = list(img_marker_re.finditer(doc_text))
+            if not matches:
+                continue
+            _img_chunks.append(doc_text)
+            _img_metas.append(meta)
+            filename = meta["filename"]
+            stem = Path(filename).stem
+            _img_chunk_counts[filename] = _img_chunk_counts.get(filename, 0) + 1
+            for match in matches:
+                img_name = match.group(2)
+                marker = match.group(0)
+                image_urls[f"{filename}::{marker}"] = (
+                    f"{base}/files/{stem}_images/{img_name}"
+                )
 
-        # Привязываем иллюстрации к пунктам ответа — строго из одного документа
+        log.info("Image candidates: %s", _img_chunk_counts)
+
+        # Привязываем иллюстрации к пунктам ответа только по локальному тексту
+        # перед маркером картинки.
         if image_urls and answer != _not_found:
             answer = _attach_images_to_answer(answer, _img_chunks, _img_metas, image_urls)
+        if image_urls:
+            image_urls = {
+                marker: url
+                for marker, url in image_urls.items()
+                if url in answer
+            }
 
         answer_html = _answer_to_html(answer, image_urls, download_urls)
 
