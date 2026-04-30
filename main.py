@@ -1200,6 +1200,135 @@ def _replace_image_markers_with_urls(
     return marker_re.sub(repl, answer), used
 
 
+def _image_caption_before_marker(text: str, marker_start: int, window: int = 700) -> str:
+    start = max(0, marker_start - window)
+    caption = text[start:marker_start]
+    caption = re.sub(r"\[Рисунок\s+\d+:\s+[^\]]+\]", " ", caption)
+    caption = re.sub(r"\s+", " ", caption).strip()
+    return caption[-window:]
+
+
+def _insert_selected_image_urls(
+    answer: str,
+    selections: list[dict],
+    image_urls: dict[str, str],
+) -> tuple[str, dict[str, str]]:
+    by_point: dict[int, list[str]] = {}
+    used: dict[str, str] = {}
+
+    for selection in selections:
+        try:
+            point = int(selection.get("point"))
+        except (TypeError, ValueError):
+            continue
+        marker = str(selection.get("marker", "")).strip()
+        url = image_urls.get(marker)
+        if point <= 0 or not url or marker in used:
+            continue
+        used[marker] = url
+        by_point.setdefault(point, []).append(url)
+
+    if not used:
+        return answer, {}
+
+    point_re = re.compile(r"^\s*(\d+)[\.\)]\s+")
+    result_lines: list[str] = []
+    inserted_points: set[int] = set()
+    for line in answer.splitlines():
+        result_lines.append(line)
+        match = point_re.match(line.strip())
+        if not match:
+            continue
+        point = int(match.group(1))
+        urls = by_point.get(point)
+        if not urls:
+            continue
+        result_lines.extend(urls)
+        inserted_points.add(point)
+
+    for point, urls in by_point.items():
+        if point not in inserted_points:
+            result_lines.extend(urls)
+
+    return "\n".join(result_lines), used
+
+
+async def _select_image_markers_for_answer(
+    question: str,
+    answer: str,
+    image_candidates: list[dict],
+) -> list[dict]:
+    if not image_candidates:
+        return []
+
+    payload = [
+        {
+            "marker": item["marker"],
+            "caption": item["caption"],
+        }
+        for item in image_candidates[:20]
+    ]
+
+    try:
+        raw = await _chat(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "Ты выбираешь иллюстрации к ответу RAG.\n"
+                        "Верни только JSON-массив без пояснений.\n"
+                        "Формат элемента: {\"point\": 1, \"marker\": \"[Рисунок ...]\"}.\n"
+                        "Выбирай картинку только если caption прямо иллюстрирует конкретный пункт ответа.\n"
+                        "Не выбирай картинки по общим похожим словам.\n"
+                        "Если уверенного соответствия нет, верни [].\n"
+                        "Используй только marker из списка, дословно."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Вопрос:\n{question}\n\n"
+                        f"Ответ:\n{answer}\n\n"
+                        "Кандидаты картинок:\n"
+                        f"{json.dumps(payload, ensure_ascii=False)}"
+                    ),
+                },
+            ],
+            max_tokens=500,
+        )
+    except Exception as e:
+        log.warning("Image marker selection failed: %s", e)
+        return []
+
+    raw = _strip_code_fence(raw)
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        match = re.search(r"\[[\s\S]*\]", raw)
+        if not match:
+            log.warning("Image marker selection returned non-JSON: %r", raw[:300])
+            return []
+        try:
+            parsed = json.loads(match.group(0))
+        except json.JSONDecodeError:
+            log.warning("Image marker selection returned invalid JSON: %r", raw[:300])
+            return []
+
+    if not isinstance(parsed, list):
+        return []
+
+    allowed = {item["marker"] for item in image_candidates}
+    selections: list[dict] = []
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        marker = str(item.get("marker", "")).strip()
+        if marker not in allowed:
+            continue
+        selections.append({"point": item.get("point"), "marker": marker})
+    return selections
+
+
 # ── Форматирование ответа в HTML ─────────────────────────────────────────────
 
 def _answer_to_html(
@@ -2271,6 +2400,7 @@ async def ask(req: AskRequest, request: Request):
         _img_chunk_counts: dict[str, int] = {}
         _simple_image_urls: dict[str, str] = {}
         _simple_marker_counts: dict[str, int] = {}
+        _image_candidates: list[dict] = []
         for doc_text, meta in zip(all_docs, all_metas):
             matches = list(img_marker_re.finditer(doc_text))
             if not matches:
@@ -2284,6 +2414,12 @@ async def ask(req: AskRequest, request: Request):
                 marker = f"[Рисунок {match.group(1)}: {filename}::{img_name}]"
                 simple_marker = match.group(0)
                 image_urls[marker] = url
+                _image_candidates.append(
+                    {
+                        "marker": marker,
+                        "caption": _image_caption_before_marker(doc_text, match.start()),
+                    }
+                )
                 _simple_image_urls[simple_marker] = url
                 _simple_marker_counts[simple_marker] = (
                     _simple_marker_counts.get(simple_marker, 0) + 1
@@ -2296,9 +2432,22 @@ async def ask(req: AskRequest, request: Request):
         log.info("Image candidates: %s", _img_chunk_counts)
 
         # Не угадываем картинки по словам. Используем только маркеры, которые
-        # LLM дословно взяла из контекста.
+        # LLM дословно взяла из контекста. Если основной ответ маркеры не
+        # скопировал, запускаем отдельный контролируемый выбор по подписям.
         if image_urls and answer != _not_found:
-            answer, image_urls = _replace_image_markers_with_urls(answer, image_urls)
+            answer, used_image_urls = _replace_image_markers_with_urls(answer, image_urls)
+            if not used_image_urls:
+                selections = await _select_image_markers_for_answer(
+                    req.question,
+                    answer,
+                    _image_candidates,
+                )
+                answer, used_image_urls = _insert_selected_image_urls(
+                    answer,
+                    selections,
+                    image_urls,
+                )
+            image_urls = used_image_urls
         else:
             image_urls = {}
 

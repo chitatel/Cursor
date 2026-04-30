@@ -1,7 +1,0 @@
-curl -X POST "https://ai.gk-osnova.ru/api/v1/auths/signin" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "email": "ВАШ_ЛОГИН_ИЛИ_EMAIL",
-    "password": "ВАШ_ПАРОЛЬ"
-  }'
-C:\Python\python.exe -m uvicorn main:app --host 0.0.0.0 --port 8000
