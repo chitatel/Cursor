@@ -1173,160 +1173,27 @@ def _most_relevant_fragments(
     return fragments
 
 
-def _qualify_image_markers(text: str, filename: str) -> str:
-    marker_re = re.compile(r"\[Рисунок\s+(\d+):\s+([^\]]+)\]")
-
-    def repl(match: re.Match) -> str:
-        return f"[Рисунок {match.group(1)}: {filename}::{match.group(2)}]"
-
-    return marker_re.sub(repl, text)
-
-
-def _replace_image_markers_with_urls(
+def _document_support_scores(
     answer: str,
-    image_urls: dict[str, str],
-) -> tuple[str, dict[str, str]]:
-    marker_re = re.compile(r"\[Рисунок\s+\d+:\s+[^\]]+\]")
-    used: dict[str, str] = {}
+    docs: list[str],
+    metas: list[dict],
+) -> dict[str, float]:
+    answer_terms = _query_terms(answer)
+    if not answer_terms:
+        return {}
 
-    def repl(match: re.Match) -> str:
-        marker = match.group(0)
-        url = image_urls.get(marker)
-        if not url:
-            return ""
-        used[marker] = url
-        return f"\n{url}"
-
-    return marker_re.sub(repl, answer), used
-
-
-def _image_caption_before_marker(text: str, marker_start: int, window: int = 700) -> str:
-    start = max(0, marker_start - window)
-    caption = text[start:marker_start]
-    caption = re.sub(r"\[Рисунок\s+\d+:\s+[^\]]+\]", " ", caption)
-    caption = re.sub(r"\s+", " ", caption).strip()
-    return caption[-window:]
-
-
-def _insert_selected_image_urls(
-    answer: str,
-    selections: list[dict],
-    image_urls: dict[str, str],
-) -> tuple[str, dict[str, str]]:
-    by_point: dict[int, list[str]] = {}
-    used: dict[str, str] = {}
-
-    for selection in selections:
-        try:
-            point = int(selection.get("point"))
-        except (TypeError, ValueError):
+    scores: dict[str, float] = {}
+    for doc_idx, (doc_text, meta) in enumerate(zip(docs, metas)):
+        filename = meta.get("filename", "")
+        doc_terms = _sentence_terms(doc_text)
+        overlap = len(answer_terms & doc_terms)
+        if overlap == 0:
             continue
-        marker = str(selection.get("marker", "")).strip()
-        url = image_urls.get(marker)
-        if point <= 0 or not url or marker in used:
-            continue
-        used[marker] = url
-        by_point.setdefault(point, []).append(url)
-
-    if not used:
-        return answer, {}
-
-    point_re = re.compile(r"^\s*(\d+)[\.\)]\s+")
-    result_lines: list[str] = []
-    inserted_points: set[int] = set()
-    for line in answer.splitlines():
-        result_lines.append(line)
-        match = point_re.match(line.strip())
-        if not match:
-            continue
-        point = int(match.group(1))
-        urls = by_point.get(point)
-        if not urls:
-            continue
-        result_lines.extend(urls)
-        inserted_points.add(point)
-
-    for point, urls in by_point.items():
-        if point not in inserted_points:
-            result_lines.extend(urls)
-
-    return "\n".join(result_lines), used
-
-
-async def _select_image_markers_for_answer(
-    question: str,
-    answer: str,
-    image_candidates: list[dict],
-) -> list[dict]:
-    if not image_candidates:
-        return []
-
-    payload = [
-        {
-            "marker": item["marker"],
-            "caption": item["caption"],
-        }
-        for item in image_candidates[:20]
-    ]
-
-    try:
-        raw = await _chat(
-            [
-                {
-                    "role": "system",
-                    "content": (
-                        "Ты выбираешь иллюстрации к ответу RAG.\n"
-                        "Верни только JSON-массив без пояснений.\n"
-                        "Формат элемента: {\"point\": 1, \"marker\": \"[Рисунок ...]\"}.\n"
-                        "Выбирай картинку только если caption прямо иллюстрирует конкретный пункт ответа.\n"
-                        "Не выбирай картинки по общим похожим словам.\n"
-                        "Если уверенного соответствия нет, верни [].\n"
-                        "Используй только marker из списка, дословно."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": (
-                        f"Вопрос:\n{question}\n\n"
-                        f"Ответ:\n{answer}\n\n"
-                        "Кандидаты картинок:\n"
-                        f"{json.dumps(payload, ensure_ascii=False)}"
-                    ),
-                },
-            ],
-            max_tokens=500,
-        )
-    except Exception as e:
-        log.warning("Image marker selection failed: %s", e)
-        return []
-
-    raw = _strip_code_fence(raw)
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError:
-        match = re.search(r"\[[\s\S]*\]", raw)
-        if not match:
-            log.warning("Image marker selection returned non-JSON: %r", raw[:300])
-            return []
-        try:
-            parsed = json.loads(match.group(0))
-        except json.JSONDecodeError:
-            log.warning("Image marker selection returned invalid JSON: %r", raw[:300])
-            return []
-
-    if not isinstance(parsed, list):
-        return []
-
-    allowed = {item["marker"] for item in image_candidates}
-    selections: list[dict] = []
-    for item in parsed:
-        if not isinstance(item, dict):
-            continue
-        marker = str(item.get("marker", "")).strip()
-        if marker not in allowed:
-            continue
-        selections.append({"point": item.get("point"), "marker": marker})
-    return selections
+        coverage = overlap / max(len(answer_terms), 1)
+        score = overlap + coverage * 10 + 1 / (doc_idx + 1)
+        if score > scores.get(filename, 0):
+            scores[filename] = score
+    return scores
 
 
 # ── Форматирование ответа в HTML ─────────────────────────────────────────────
@@ -1433,14 +1300,13 @@ def _attach_images_to_answer(
 
     def bag(text: str) -> set[str]:
         cleaned = img_marker_re.sub("", text)
-        return _query_terms(cleaned)
+        return set(re.findall(r"[А-Яа-яЁёA-Za-z0-9-]{4,}", cleaned.lower()))
 
     # Группируем маркеры: если между двумя маркерами нет значимого текста
     # (менее 3 слов), они образуют одну группу
     # group = (preceding_bag, [url1, url2, ...])
     groups: list[tuple[set[str], list[str]]] = []
-    for chunk_text, meta in zip(chunks, chunk_metas):
-        filename = meta.get("filename", "")
+    for chunk_text in chunks:
         markers_in_chunk = list(img_marker_re.finditer(chunk_text))
         if not markers_in_chunk:
             continue
@@ -1449,18 +1315,15 @@ def _attach_images_to_answer(
         current_group_preceding: set[str] = set()
 
         for i, match in enumerate(markers_in_chunk):
-            marker = match.group(0)
-            url = image_urls.get(f"{filename}::{marker}") or image_urls.get(marker)
+            url = image_urls.get(match.group(0))
             if not url:
                 continue
 
-            previous_end = markers_in_chunk[i - 1].end() if i > 0 else 0
-            start = max(previous_end, match.start() - 450)
+            start = markers_in_chunk[i - 1].end() if i > 0 else 0
             preceding_text = chunk_text[start:match.start()]
             preceding_words = bag(preceding_text)
-            separator_words = bag(chunk_text[previous_end:match.start()]) if i > 0 else preceding_words
 
-            if i == 0 or len(separator_words) >= 1:
+            if i == 0 or len(preceding_words) >= 1:
                 # Начало новой группы: первый маркер или есть хоть одно слово перед ним
                 if current_group_urls:
                     groups.append((current_group_preceding, current_group_urls))
@@ -1495,19 +1358,15 @@ def _attach_images_to_answer(
 
         best_idx = -1
         best_score = 0
-        best_coverage = 0.0
         for idx, (preceding_bag, urls) in enumerate(groups):
             if idx in used_groups:
                 continue
-            overlap = point_bag & preceding_bag
-            score = len(overlap)
-            coverage = score / max(len(point_bag), 1)
-            if score > best_score or (score == best_score and coverage > best_coverage):
+            score = len(point_bag & preceding_bag)
+            if score > best_score:
                 best_score = score
-                best_coverage = coverage
                 best_idx = idx
 
-        if best_idx >= 0 and best_score >= 2 and best_coverage >= 0.25:
+        if best_idx >= 0 and best_score >= 2:
             used_groups.add(best_idx)
             all_urls = "\n".join(groups[best_idx][1])
             result_parts.append(f"{point}\n{all_urls}")
@@ -2305,16 +2164,11 @@ async def ask(req: AskRequest, request: Request):
             all_docs = docs
             all_metas = metas
 
-        context_docs = [
-            _qualify_image_markers(d, m["filename"])
-            for d, m in zip(all_docs, all_metas)
-        ]
-
         context = "\n\n".join(
             f"[CHUNK {i} | {m['filename']}]\n{d}"
-            for i, (d, m) in enumerate(zip(context_docs, all_metas))
+            for i, (d, m) in enumerate(zip(all_docs, all_metas))
         )
-        relevant_fragments = _most_relevant_fragments(req.question, context_docs, all_metas)
+        relevant_fragments = _most_relevant_fragments(req.question, all_docs, all_metas)
         relevant_context = "\n".join(
             f"{i}. {fragment}"
             for i, fragment in enumerate(relevant_fragments, start=1)
@@ -2336,9 +2190,6 @@ async def ask(req: AskRequest, request: Request):
                             "Блок 'Наиболее релевантные фрагменты' — это подсказка для ответа; если там есть прямой ответ, используй его и не отвечай 'Информация в документах не найдена'.\n"
                             "Если в контексте нет прямого ответа на вопрос, ответь ровно одной фразой: Информация в документах не найдена.\n"
                             "Оформляй ответ единым нумерованным списком со сквозной нумерацией (1. 2. 3. ...), каждый шаг — отдельным пунктом. Не перезапускай нумерацию.\n"
-                            "Если рядом с использованным текстом в контексте есть маркер вида [Рисунок N: файл::img_NNN.png], скопируй этот маркер отдельной строкой сразу после соответствующего пункта ответа.\n"
-                            "Не добавляй маркеры картинок из других пунктов, других разделов или просто похожих документов.\n"
-                            "Не выдумывай маркеры картинок: можно использовать только маркеры, которые дословно есть в контексте.\n"
                             "Если спрашивают 'какие бывают', 'виды', 'типы', 'перечислить' — дай нумерованный список элементов; если спрашивают 'как сделать', 'порядок', 'процесс' — дай пошаговую инструкцию. Включай все значимые шаги из контекста, в том числе подсказки, исправления ошибок и важные замечания.\n"
                             "Отвечай по существу, с небольшим введением.\n"
                             "Не пиши фразы вроде: 'Давайте разберем', 'Вот пошаговая инструкция', 'Based on the provided documentation', 'Okay'.\n"
@@ -2380,13 +2231,42 @@ async def ask(req: AskRequest, request: Request):
 
         base = _public_base_url(request)
 
-        # Собираем URL картинок по уникальным маркерам, которые LLM видела
-        # в контексте и может дословно скопировать в ответ.
+        # Собираем ссылки на изображения СТРОГО из одного документа.
+        # Приоритет: документ, чьё имя файла совпадает с темой вопроса.
+        # Фоллбэк: первый чанк с картинками (самый релевантный).
         image_urls: dict[str, str] = {}
         img_marker_re = re.compile(r"\[Рисунок (\d+): ([^\]]+)\]")
 
         # Корни слов вопроса (первые 5 букв слов длиной ≥5)
         _q_roots = {w[:5] for w in re.findall(r"[а-яёa-z]{5,}", req.question.lower())}
+        _support_scores = _document_support_scores(answer, all_docs, all_metas)
+
+        # Ищем документ с картинками, который реально поддерживает ответ.
+        # Имя файла используется только как tie-breaker.
+        _img_source_file = None
+        _best_fname_score = 0
+        _best_img_score = 0.0
+        _img_chunk_counts: dict[str, int] = {}  # файл → кол-во чанков с картинками
+        for doc_idx, (doc_text, meta) in enumerate(zip(all_docs, all_metas)):
+            fn = meta["filename"]
+            if img_marker_re.search(doc_text):
+                _img_chunk_counts[fn] = _img_chunk_counts.get(fn, 0) + 1
+                fn_roots = {w[:5] for w in re.findall(r"[а-яёa-z]{5,}",
+                            fn.replace("_", " ").replace("-", " ").lower())}
+                fname_score = len(_q_roots & fn_roots)
+                support_score = _support_scores.get(fn, 0)
+                score = support_score * 100 + fname_score + 1 / (doc_idx + 1)
+                if score > _best_img_score:
+                    _best_img_score = score
+                    _best_fname_score = fname_score
+                    _img_source_file = fn
+
+        # Фоллбэк: документ с наибольшим числом чанков с картинками
+        if not _img_source_file and _img_chunk_counts:
+            _img_source_file = max(_img_chunk_counts, key=_img_chunk_counts.get)
+
+        log.info("Image source: %s (support_scores=%s, fname_score=%d, img_chunks=%s)",
+                 _img_source_file, _support_scores, _best_fname_score, _img_chunk_counts)
 
         # Источники: самый релевантный документ (по совпадению имени с вопросом) первым
         _fname_relevance: dict[str, int] = {}
@@ -2394,62 +2274,34 @@ async def ask(req: AskRequest, request: Request):
             fn_roots = {w[:5] for w in re.findall(r"[а-яёa-z]{5,}",
                         fn.replace("_", " ").replace("-", " ").lower())}
             _fname_relevance[fn] = len(_q_roots & fn_roots)
-        sources = sorted(_all_sources, key=lambda fn: _fname_relevance.get(fn, 0), reverse=True)
+        sources = sorted(
+            _all_sources,
+            key=lambda fn: (_support_scores.get(fn, 0), _fname_relevance.get(fn, 0)),
+            reverse=True,
+        )
         download_urls = {s: f"{base}/files/{s}" for s in sources}
 
-        _img_chunk_counts: dict[str, int] = {}
-        _simple_image_urls: dict[str, str] = {}
-        _simple_marker_counts: dict[str, int] = {}
-        _image_candidates: list[dict] = []
-        for doc_text, meta in zip(all_docs, all_metas):
-            matches = list(img_marker_re.finditer(doc_text))
-            if not matches:
-                continue
-            filename = meta["filename"]
-            stem = Path(filename).stem
-            _img_chunk_counts[filename] = _img_chunk_counts.get(filename, 0) + 1
-            for match in matches:
-                img_name = match.group(2)
-                url = f"{base}/files/{stem}_images/{img_name}"
-                marker = f"[Рисунок {match.group(1)}: {filename}::{img_name}]"
-                simple_marker = match.group(0)
-                image_urls[marker] = url
-                _image_candidates.append(
-                    {
-                        "marker": marker,
-                        "caption": _image_caption_before_marker(doc_text, match.start()),
-                    }
-                )
-                _simple_image_urls[simple_marker] = url
-                _simple_marker_counts[simple_marker] = (
-                    _simple_marker_counts.get(simple_marker, 0) + 1
-                )
+        # Собираем чанки и картинки из расширенного контекста (all_docs),
+        # но только из файла-источника картинок
+        _img_chunks: list[str] = []
+        _img_metas: list[dict] = []
+        if _img_source_file:
+            for doc_text, meta in zip(all_docs, all_metas):
+                if meta["filename"] == _img_source_file:
+                    _img_chunks.append(doc_text)
+                    _img_metas.append(meta)
+                    for match in img_marker_re.finditer(doc_text):
+                        img_name = match.group(2)
+                        marker = match.group(0)
+                        if marker not in image_urls:
+                            stem = Path(meta["filename"]).stem
+                            image_urls[marker] = (
+                                f"{base}/files/{stem}_images/{img_name}"
+                            )
 
-        for marker, count in _simple_marker_counts.items():
-            if count == 1:
-                image_urls[marker] = _simple_image_urls[marker]
-
-        log.info("Image candidates: %s", _img_chunk_counts)
-
-        # Не угадываем картинки по словам. Используем только маркеры, которые
-        # LLM дословно взяла из контекста. Если основной ответ маркеры не
-        # скопировал, запускаем отдельный контролируемый выбор по подписям.
+        # Привязываем иллюстрации к пунктам ответа — строго из одного документа
         if image_urls and answer != _not_found:
-            answer, used_image_urls = _replace_image_markers_with_urls(answer, image_urls)
-            if not used_image_urls:
-                selections = await _select_image_markers_for_answer(
-                    req.question,
-                    answer,
-                    _image_candidates,
-                )
-                answer, used_image_urls = _insert_selected_image_urls(
-                    answer,
-                    selections,
-                    image_urls,
-                )
-            image_urls = used_image_urls
-        else:
-            image_urls = {}
+            answer = _attach_images_to_answer(answer, _img_chunks, _img_metas, image_urls)
 
         answer_html = _answer_to_html(answer, image_urls, download_urls)
 
