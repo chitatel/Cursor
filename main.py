@@ -1206,6 +1206,73 @@ def _most_relevant_fragments(
     return fragments
 
 
+def _looks_like_section_heading(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped or len(stripped) > 140:
+        return False
+    low = stripped.lower()
+    if low.startswith(("как ", "что ", "где ", "когда ")):
+        return True
+    if re.match(r"^\d+[\.\)]\s+\S", stripped) and not stripped.endswith((".", ";", ":")):
+        return True
+    return False
+
+
+def _target_section_context(
+    query: str,
+    docs: list[str],
+    metas: list[dict],
+    max_chars: int = 2500,
+) -> str:
+    q_terms = _query_terms(query)
+    if not q_terms:
+        return ""
+
+    best: tuple[float, int, int] | None = None
+    best_lines: list[str] = []
+    best_meta: dict = {}
+
+    for doc_idx, (doc_text, meta) in enumerate(zip(docs, metas)):
+        lines = [line.strip() for line in doc_text.splitlines() if line.strip()]
+        if not lines:
+            continue
+        for line_idx, line in enumerate(lines):
+            line_terms = _sentence_terms(line)
+            overlap = len(q_terms & line_terms)
+            if overlap == 0:
+                continue
+            score = overlap
+            if _looks_like_section_heading(line):
+                score += 2
+            if query.lower().strip() in line.lower():
+                score += 3
+            ranked = (float(score), -doc_idx, -line_idx)
+            if best is None or ranked > best:
+                best = ranked
+                best_lines = lines
+                best_meta = meta
+
+    if best is None or not best_lines:
+        return ""
+
+    start_idx = -best[2]
+    collected: list[str] = []
+    for idx in range(start_idx, len(best_lines)):
+        line = best_lines[idx]
+        if idx > start_idx and collected and _looks_like_section_heading(line):
+            break
+        collected.append(line)
+        if len("\n".join(collected)) >= max_chars:
+            break
+
+    if not collected:
+        return ""
+
+    filename = best_meta.get("filename", "")
+    chunk_index = best_meta.get("chunk_index", 0)
+    return f"[{filename} | chunk {chunk_index}]\n" + "\n".join(collected)
+
+
 def _document_support_scores(
     answer: str,
     docs: list[str],
@@ -2208,6 +2275,7 @@ async def ask(req: AskRequest, request: Request):
             f"{i}. {fragment}"
             for i, fragment in enumerate(relevant_fragments, start=1)
         )
+        target_context = _target_section_context(req.question, all_docs, all_metas)
         _all_sources = list(dict.fromkeys(m["filename"] for m in all_metas))
 
         try:
@@ -2230,6 +2298,7 @@ async def ask(req: AskRequest, request: Request):
                             "Отвечай по существу, с небольшим введением.\n"
                             "Не пиши фразы вроде: 'Давайте разберем', 'Вот пошаговая инструкция', 'Based on the provided documentation', 'Okay'.\n"
                             "Не переводи термины на английский и не смешивай языки.\n"
+                            "Если блок 'Целевой раздел' заполнен, отвечай только по нему; полный контекст используй только для проверки, не добавляй из него соседние разделы.\n"
                             "Если есть сомнение, лучше ответь: Информация в документах не найдена."
                         ),
                     },
@@ -2238,6 +2307,8 @@ async def ask(req: AskRequest, request: Request):
                         "content": (
                             f"Наиболее релевантные фрагменты:\n\n"
                             f"{relevant_context or 'Нет выделенных фрагментов.'}\n\n"
+                            f"Целевой раздел:\n\n"
+                            f"{target_context or 'Не выделен.'}\n\n"
                             f"Полный контекст:\n\n{context}\n\n"
                             f"Вопрос: {req.question}"
                         ),
