@@ -533,12 +533,26 @@ async def _search_records(
         index = _get_faiss_index_sync(records)
 
     if not records:
-        return {"ids": [[]], "documents": [[]], "metadatas": [[]], "distances": [[]]}
+        return {
+            "ids": [[]],
+            "documents": [[]],
+            "metadatas": [[]],
+            "distances": [[]],
+            "lexical_scores": [[]],
+            "filename_scores": [[]],
+        }
 
     if category is not None:
         allowed_ids = {r["id"] for r in records if r.get("category") == category}
         if not allowed_ids:
-            return {"ids": [[]], "documents": [[]], "metadatas": [[]], "distances": [[]]}
+            return {
+                "ids": [[]],
+                "documents": [[]],
+                "metadatas": [[]],
+                "distances": [[]],
+                "lexical_scores": [[]],
+                "filename_scores": [[]],
+            }
     else:
         allowed_ids = None
 
@@ -567,11 +581,19 @@ async def _search_records(
         lexical_records = records
     lexical_fetch_k = min(max(top_k * 8, 12), len(lexical_records))
     lexical_texts = [f"{record['filename']} {record['text']}" for record in lexical_records]
-    lexical_scores = _bm25_scores(query, lexical_texts)
+    bm25_scores = _bm25_scores(query, lexical_texts)
+    filename_scores_by_id = {
+        record["id"]: _filename_match_boost(query, record["filename"])
+        for record in lexical_records
+    }
     lexical_scores = [
-        score + _filename_match_boost(query, record["filename"])
-        for score, record in zip(lexical_scores, lexical_records)
+        score + filename_scores_by_id.get(record["id"], 0.0)
+        for score, record in zip(bm25_scores, lexical_records)
     ]
+    lexical_scores_by_id = {
+        record["id"]: float(score)
+        for score, record in zip(lexical_scores, lexical_records)
+    }
     lexical_ids = [
         lexical_records[i]["id"]
         for i in sorted(range(len(lexical_scores)), key=lambda x: lexical_scores[x], reverse=True)[:lexical_fetch_k]
@@ -584,6 +606,8 @@ async def _search_records(
     docs: list[str] = []
     metas: list[dict] = []
     distances: list[float] = []
+    result_lexical_scores: list[float] = []
+    result_filename_scores: list[float] = []
     for doc_id in fused_ids:
         if doc_id not in id_to_record:
             continue
@@ -595,8 +619,17 @@ async def _search_records(
             "chunk_index": record.get("chunk_index", 0),
         })
         distances.append(vector_distances.get(doc_id, 1.0))
+        result_lexical_scores.append(lexical_scores_by_id.get(doc_id, 0.0))
+        result_filename_scores.append(filename_scores_by_id.get(doc_id, 0.0))
 
-    return {"ids": [ids], "documents": [docs], "metadatas": [metas], "distances": [distances]}
+    return {
+        "ids": [ids],
+        "documents": [docs],
+        "metadatas": [metas],
+        "distances": [distances],
+        "lexical_scores": [result_lexical_scores],
+        "filename_scores": [result_filename_scores],
+    }
 
 
 def _build_document_aware_context(
@@ -2121,6 +2154,7 @@ async def ask(req: AskRequest, request: Request):
         docs = results["documents"][0]
         metas = results["metadatas"][0]
         distances = results["distances"][0]
+        filename_scores = results.get("filename_scores", [[]])[0]
 
         _not_found = "Информация в документах не найдена."
         _not_found_html = _answer_to_html(_not_found, {})
@@ -2139,9 +2173,10 @@ async def ask(req: AskRequest, request: Request):
             )
 
         best_sim = 1 - distances[0]
-        log.info("Best similarity: %.3f", best_sim)
+        best_filename_score = filename_scores[0] if filename_scores else 0.0
+        log.info("Best similarity: %.3f (filename_score=%.3f)", best_sim, best_filename_score)
         log_entry["best_similarity"] = round(float(best_sim), 4)
-        if best_sim < SIM_THRESHOLD:
+        if best_sim < SIM_THRESHOLD and best_filename_score < 0.7:
             log_entry["answer"] = _not_found
             return AskResponse(
                 answer=_not_found,
