@@ -2221,7 +2221,8 @@ async def ask(req: AskRequest, request: Request):
                             "Строго следуй порядку изложения в контексте — не переставляй шаги местами и не начинай с середины.\n"
                             "Строго запрещено придумывать шаги, роли, ограничения, числа, лимиты, сроки и требования, которых нет в контексте.\n"
                             "Строго запрещено объединять информацию из разных разделов или подпунктов в один шаг.\n"
-                            "Не пропускай разделы из контекста — включай все: основные шаги, исправления ошибок, примечания, подсказки.\n"
+                            "Отвечай только по разделу или фрагменту, который прямо соответствует вопросу. Не добавляй соседние разделы из контекста, если они отвечают на другой вопрос.\n"
+                            "Включай исправления ошибок, примечания и подсказки только из того же релевантного раздела.\n"
                             "Блок 'Наиболее релевантные фрагменты' — это подсказка для ответа; если там есть прямой ответ, используй его и не отвечай 'Информация в документах не найдена'.\n"
                             "Если в контексте нет прямого ответа на вопрос, ответь ровно одной фразой: Информация в документах не найдена.\n"
                             "Оформляй ответ единым нумерованным списком со сквозной нумерацией (1. 2. 3. ...), каждый шаг — отдельным пунктом. Не перезапускай нумерацию.\n"
@@ -2266,42 +2267,13 @@ async def ask(req: AskRequest, request: Request):
 
         base = _public_base_url(request)
 
-        # Собираем ссылки на изображения СТРОГО из одного документа.
-        # Приоритет: документ, чьё имя файла совпадает с темой вопроса.
-        # Фоллбэк: первый чанк с картинками (самый релевантный).
+        # Собираем ссылки на изображения СТРОГО из основного документа ответа.
         image_urls: dict[str, str] = {}
         img_marker_re = re.compile(r"\[Рисунок (\d+): ([^\]]+)\]")
 
         # Корни слов вопроса (первые 5 букв слов длиной ≥5)
         _q_roots = {w[:5] for w in re.findall(r"[а-яёa-z]{5,}", req.question.lower())}
         _support_scores = _document_support_scores(answer, all_docs, all_metas)
-
-        # Ищем документ с картинками, который реально поддерживает ответ.
-        # Имя файла используется только как tie-breaker.
-        _img_source_file = None
-        _best_fname_score = 0
-        _best_img_score = 0.0
-        _img_chunk_counts: dict[str, int] = {}  # файл → кол-во чанков с картинками
-        for doc_idx, (doc_text, meta) in enumerate(zip(all_docs, all_metas)):
-            fn = meta["filename"]
-            if img_marker_re.search(doc_text):
-                _img_chunk_counts[fn] = _img_chunk_counts.get(fn, 0) + 1
-                fn_roots = {w[:5] for w in re.findall(r"[а-яёa-z]{5,}",
-                            fn.replace("_", " ").replace("-", " ").lower())}
-                fname_score = len(_q_roots & fn_roots)
-                support_score = _support_scores.get(fn, 0)
-                score = support_score * 100 + fname_score + 1 / (doc_idx + 1)
-                if score > _best_img_score:
-                    _best_img_score = score
-                    _best_fname_score = fname_score
-                    _img_source_file = fn
-
-        # Фоллбэк: документ с наибольшим числом чанков с картинками
-        if not _img_source_file and _img_chunk_counts:
-            _img_source_file = max(_img_chunk_counts, key=_img_chunk_counts.get)
-
-        log.info("Image source: %s (support_scores=%s, fname_score=%d, img_chunks=%s)",
-                 _img_source_file, _support_scores, _best_fname_score, _img_chunk_counts)
 
         # Источники: самый релевантный документ (по совпадению имени с вопросом) первым
         _fname_relevance: dict[str, int] = {}
@@ -2315,6 +2287,23 @@ async def ask(req: AskRequest, request: Request):
             reverse=True,
         )
         download_urls = {s: f"{base}/files/{s}" for s in sources}
+        _primary_source = sources[0] if sources else None
+
+        _img_chunk_counts: dict[str, int] = {}
+        for doc_text, meta in zip(all_docs, all_metas):
+            if img_marker_re.search(doc_text):
+                fn = meta["filename"]
+                _img_chunk_counts[fn] = _img_chunk_counts.get(fn, 0) + 1
+
+        _img_source_file = _primary_source if _primary_source in _img_chunk_counts else None
+
+        log.info(
+            "Image source: %s (primary_source=%s, support_scores=%s, img_chunks=%s)",
+            _img_source_file,
+            _primary_source,
+            _support_scores,
+            _img_chunk_counts,
+        )
 
         # Собираем чанки и картинки из расширенного контекста (all_docs),
         # но только из файла-источника картинок
