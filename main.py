@@ -918,6 +918,7 @@ async def _chat(messages: list[dict], max_tokens: int = 400) -> str:
                 "top_p": 0.85,
                 "top_k": 30,
                 "repeat_penalty": 1.15,
+                "num_predict": max_tokens,
                 "num_ctx": 8192,
             },
         }
@@ -1316,7 +1317,7 @@ def _answer_to_html(
     Конвертирует текстовый ответ в HTML для отображения в 1С.
     - Нумерованные пункты → <ol><li>
     - URL картинок → <img> теги
-    - Ссылки на документы-источники внизу
+    - Ссылки на документы перед ответом
     - Остальной текст → <p>
     """
     from html import escape
@@ -1327,6 +1328,18 @@ def _answer_to_html(
     numbered_re = re.compile(r"^(\d+)[\.\)]\s+(.*)")
 
     url_set = set(image_urls.values()) if image_urls else set()
+
+    # Блок ссылок на документы-источники перед ответом
+    if download_urls:
+        html_parts.append('<p style="margin-top:0; font-size:13px; color:#666;">Вам может подойти:</p>')
+        html_parts.append('<ul style="padding-left:20px; font-size:13px;">')
+        for filename, url in download_urls.items():
+            html_parts.append(
+                f'<li><a href="{escape(url)}" style="color:#1a73e8; text-decoration:none;">'
+                f'{escape(filename)}</a></li>'
+            )
+        html_parts.append("</ul>")
+        html_parts.append('<hr style="margin:14px 0 16px; border:none; border-top:1px solid #ddd;">')
 
     for line in lines:
         stripped = line.strip()
@@ -1363,18 +1376,6 @@ def _answer_to_html(
 
     if in_list:
         html_parts.append("</li></ol>")
-
-    # Блок ссылок на документы-источники
-    if download_urls:
-        html_parts.append('<hr style="margin-top:16px; border:none; border-top:1px solid #ddd;">')
-        html_parts.append('<p style="margin-top:12px; font-size:13px; color:#666;">Источники:</p>')
-        html_parts.append('<ul style="padding-left:20px; font-size:13px;">')
-        for filename, url in download_urls.items():
-            html_parts.append(
-                f'<li><a href="{escape(url)}" style="color:#1a73e8; text-decoration:none;">'
-                f'{escape(filename)}</a></li>'
-            )
-        html_parts.append("</ul>")
 
     body = "\n".join(html_parts)
     return (
