@@ -923,6 +923,8 @@ async def _chat(messages: list[dict], max_tokens: int = 400) -> str:
             if response.status_code == 401 and OPENWEBUI_PASSWORD and OPENWEBUI_USER:
                 refreshed_headers = await _api_headers(force_refresh=True)
                 response = await c.post(_chat_url(), headers=refreshed_headers, json=payload)
+            if response.status_code >= 400:
+                log.error("Chat API error %s: %s", response.status_code, response.text)
             response.raise_for_status()
             return response
 
