@@ -801,6 +801,10 @@ def _chat_url() -> str:
     return f"{_base_url()}/api/chat"
 
 
+def _openwebui_ollama_chat_url() -> str:
+    return f"{_openwebui_root_url()}/ollama/api/chat"
+
+
 def _embed_url() -> str:
     mode = _api_mode()
     if mode == "openai":
@@ -918,21 +922,34 @@ async def _chat(messages: list[dict], max_tokens: int = 400) -> str:
             },
         }
 
-        async def _post(payload):
-            response = await c.post(_chat_url(), headers=headers, json=payload)
+        async def _post(url: str, payload: dict):
+            response = await c.post(url, headers=headers, json=payload)
             if response.status_code == 401 and OPENWEBUI_PASSWORD and OPENWEBUI_USER:
                 refreshed_headers = await _api_headers(force_refresh=True)
-                response = await c.post(_chat_url(), headers=refreshed_headers, json=payload)
+                response = await c.post(url, headers=refreshed_headers, json=payload)
             if response.status_code >= 400:
-                log.error("Chat API error %s: %s", response.status_code, response.text)
+                log.error("Chat API error %s at %s: %s", response.status_code, url, response.text)
             response.raise_for_status()
             return response
 
-        if mode in {"openai", "openwebui"}:
-            response = await _post(payload_openai)
+        if mode == "openai":
+            response = await _post(_chat_url(), payload_openai)
             content = response.json()["choices"][0]["message"]["content"]
+        elif mode == "openwebui":
+            try:
+                response = await _post(_chat_url(), payload_openai)
+                content = response.json()["choices"][0]["message"]["content"]
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code != 400:
+                    raise
+                log.warning(
+                    "OpenWebUI /api/chat/completions returned 400; "
+                    "retrying via /ollama/api/chat"
+                )
+                response = await _post(_openwebui_ollama_chat_url(), payload_ollama)
+                content = response.json().get("message", {}).get("content", "")
         else:
-            response = await _post(payload_ollama)
+            response = await _post(_chat_url(), payload_ollama)
             content = response.json().get("message", {}).get("content", "")
 
         if not content:
