@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Optional
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 import httpx
 import numpy as np
@@ -124,6 +125,7 @@ _indexing_locks: dict[str, asyncio.Lock] = {}
 _auth_token: Optional[str] = None
 _auth_lock = asyncio.Lock()
 _ask_log_lock = asyncio.Lock()
+LOCAL_TZ = ZoneInfo(CONFIG.get("LOCAL_TIMEZONE", "Europe/Volgograd"))
 
 
 # ── Хранилище записей ────────────────────────────────────────────────────────
@@ -179,6 +181,20 @@ async def _log_ask(entry: dict) -> None:
         log.warning("Failed to write ask log: %s", e)
 
 
+def _utc_iso_to_local_iso(value: str) -> str:
+    """Конвертирует timestamp из UTC в локальную зону для отображения в 1С."""
+    if not value:
+        return value
+    try:
+        normalized = value.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(normalized)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(LOCAL_TZ).isoformat()
+    except ValueError:
+        return value
+
+
 async def _read_ask_log(
     limit: int,
     date_from: Optional[str] = None,
@@ -207,6 +223,8 @@ async def _read_ask_log(
                     continue
                 if date_to and ts > date_to:
                     continue
+                item["timestamp_utc"] = ts
+                item["timestamp"] = _utc_iso_to_local_iso(ts)
                 entries.append(item)
     entries.reverse()
     return entries[:limit]
