@@ -936,18 +936,8 @@ async def _chat(messages: list[dict], max_tokens: int = 400) -> str:
             response = await _post(_chat_url(), payload_openai)
             content = response.json()["choices"][0]["message"]["content"]
         elif mode == "openwebui":
-            try:
-                response = await _post(_chat_url(), payload_openai)
-                content = response.json()["choices"][0]["message"]["content"]
-            except httpx.HTTPStatusError as e:
-                if e.response.status_code != 400:
-                    raise
-                log.warning(
-                    "OpenWebUI /api/chat/completions returned 400; "
-                    "retrying via /ollama/api/chat"
-                )
-                response = await _post(_openwebui_ollama_chat_url(), payload_ollama)
-                content = response.json().get("message", {}).get("content", "")
+            response = await _post(_openwebui_ollama_chat_url(), payload_ollama)
+            content = response.json().get("message", {}).get("content", "")
         else:
             response = await _post(_chat_url(), payload_ollama)
             content = response.json().get("message", {}).get("content", "")
