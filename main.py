@@ -1349,14 +1349,32 @@ def _answer_to_html(
 
     # Блок ссылок на документы-источники перед ответом
     if download_urls:
+        source_items = list(download_urls.items())
+        visible_sources = source_items[:2]
+        hidden_sources = source_items[2:]
+
         html_parts.append('<p style="margin-top:0; font-size:13px; color:#666;">Вам может подойти:</p>')
         html_parts.append('<ul style="padding-left:20px; font-size:13px;">')
-        for filename, url in download_urls.items():
+        for filename, url in visible_sources:
             html_parts.append(
                 f'<li><a href="{escape(url)}" style="color:#1a73e8; text-decoration:none;">'
                 f'{escape(filename)}</a></li>'
             )
         html_parts.append("</ul>")
+
+        if hidden_sources:
+            html_parts.append(
+                '<details style="margin-top:-4px; margin-left:20px; font-size:13px;">'
+                '<summary style="cursor:pointer; color:#1a73e8;">Еще</summary>'
+            )
+            html_parts.append('<ul style="padding-left:20px; margin-top:8px;">')
+            for filename, url in hidden_sources:
+                html_parts.append(
+                    f'<li><a href="{escape(url)}" style="color:#1a73e8; text-decoration:none;">'
+                    f'{escape(filename)}</a></li>'
+                )
+            html_parts.append("</ul></details>")
+
         html_parts.append('<hr style="margin:14px 0 16px; border:none; border-top:1px solid #ddd;">')
 
     for line in lines:
