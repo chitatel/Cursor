@@ -401,6 +401,27 @@ async def _delete_document_records(filename: str) -> int:
         return removed
 
 
+async def _delete_category_records(category: str) -> dict[str, int]:
+    """Удаляет из индекса все документы указанной категории за один rebuild."""
+    global _faiss_index
+    async with _records_lock:
+        current = _load_records_sync()
+        removed_by_file: dict[str, int] = {}
+        records = []
+        for record in current:
+            if record.get("category") == category:
+                fn = record["filename"]
+                removed_by_file[fn] = removed_by_file.get(fn, 0) + 1
+            else:
+                records.append(record)
+        if not removed_by_file:
+            return {}
+        _faiss_index = None
+        _save_records_sync(records)
+        _rebuild_faiss_index_sync(records)
+        return removed_by_file
+
+
 # ── Безопасность файловых путей ───────────────────────────────────────────────
 
 def _safe_filename(filename: str) -> str:
@@ -2205,6 +2226,41 @@ async def update_document_category(filename: str, body: CategoryUpdateRequest):
     norm_cat = _normalize_category(body.category)
     updated = await _update_document_category(filename, norm_cat)
     return {"filename": filename, "category": norm_cat, "chunks_updated": updated}
+
+
+@app.delete("/documents")
+async def delete_documents_by_category(category: Optional[str] = None):
+    """Удалить все документы указанной категории."""
+    norm_cat = _normalize_category(category)
+    if norm_cat is None:
+        raise HTTPException(400, "category is required")
+
+    indexing_now = [
+        fn for fn, info in _indexing.items()
+        if info.get("status") == "indexing" and info.get("category") == norm_cat
+    ]
+    if indexing_now:
+        raise HTTPException(
+            409,
+            f"Category '{norm_cat}' has documents currently being indexed: {', '.join(indexing_now)}",
+        )
+
+    removed_by_file = await _delete_category_records(norm_cat)
+    if not removed_by_file:
+        raise HTTPException(404, f"No documents found for category '{norm_cat}'")
+
+    for filename in removed_by_file:
+        (FILES_DIR / filename).unlink(missing_ok=True)
+        images_dir = FILES_DIR / f"{Path(filename).stem}_images"
+        if images_dir.is_dir():
+            shutil.rmtree(images_dir, ignore_errors=True)
+        _indexing.pop(filename, None)
+
+    return {
+        "category": norm_cat,
+        "documents_removed": sorted(removed_by_file),
+        "chunks_removed": sum(removed_by_file.values()),
+    }
 
 
 @app.delete("/documents/{filename}")
