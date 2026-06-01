@@ -1629,51 +1629,88 @@ def _extract_docx_with_images(path: Path) -> list:
 
 def _extract_pdf_with_images(path: Path) -> list:
     """
-    Извлекает текст из .pdf с сохранением изображений.
+    Извлекает текст из .pdf с сохранением изображений через PyMuPDF (fitz).
     Изображения сохраняются в FILES_DIR/<stem>_images/img_001.ext и т.д.
     В текст вставляются маркеры [Рисунок N: img_NNN.ext] после текста каждой страницы.
+
+    PyMuPDF корректно достаёт картинки любых типов (включая прозрачные, с масками,
+    form XObjects), в отличие от pypdf — он молча пропускает сложные случаи.
     """
-    from pypdf import PdfReader
+    try:
+        import fitz  # PyMuPDF
+    except ImportError as e:
+        raise RuntimeError(
+            "PDF support requires PyMuPDF: pip install pymupdf"
+        ) from e
     from llama_index.core.schema import Document
 
-    reader = PdfReader(str(path))
+    doc = fitz.open(str(path))
     stem = path.stem
     images_dir = FILES_DIR / f"{stem}_images"
     images_dir.mkdir(exist_ok=True)
 
     img_counter = 0
     parts: list[str] = []
+    seen_xrefs: dict[int, str] = {}  # один и тот же xref на разных страницах → один маркер
 
-    for page_num, page in enumerate(reader.pages):
-        # Извлекаем текст страницы
-        page_text = (page.extract_text() or "").strip()
-        if page_text:
-            parts.append(page_text)
+    try:
+        for page_num in range(len(doc)):
+            page = doc[page_num]
 
-        # Извлекаем изображения страницы
-        page_images: list[str] = []
-        if hasattr(page, "images"):
-            for img in page.images:
+            # Текст страницы
+            page_text = page.get_text().strip()
+            if page_text:
+                parts.append(page_text)
+
+            # Картинки страницы (по xref)
+            try:
+                image_list = page.get_images(full=True)
+            except Exception as e:
+                log.warning("[%s] page %d get_images failed: %s", path.name, page_num + 1, e)
+                image_list = []
+
+            page_markers: list[str] = []
+            for img_info in image_list:
+                xref = img_info[0]
+                if xref in seen_xrefs:
+                    page_markers.append(seen_xrefs[xref])
+                    continue
+                try:
+                    base_image = doc.extract_image(xref)
+                except Exception as e:
+                    log.warning("[%s] page %d extract_image(xref=%d) failed: %s",
+                                path.name, page_num + 1, xref, e)
+                    continue
+                img_bytes = base_image.get("image")
+                if not img_bytes:
+                    continue
+                ext = base_image.get("ext", "png").lower().lstrip(".")
+                if ext not in ("png", "jpg", "jpeg", "gif", "bmp", "tiff", "webp"):
+                    ext = "png"
                 img_counter += 1
-                ext = Path(img.name).suffix.lower() or ".png"
-                if ext not in (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tiff"):
-                    ext = ".png"
-                img_name = f"img_{img_counter:03d}{ext}"
+                img_name = f"img_{img_counter:03d}.{ext}"
                 img_path = images_dir / img_name
-                img_path.write_bytes(img.data)
+                img_path.write_bytes(img_bytes)
                 marker = f"[Рисунок {img_counter}: {img_name}]"
-                page_images.append(marker)
-                log.info("[%s] Extracted image from page %d: %s", path.name, page_num + 1, img_name)
+                seen_xrefs[xref] = marker
+                page_markers.append(marker)
+                log.info("[%s] Extracted image from page %d: %s (xref=%d)",
+                         path.name, page_num + 1, img_name, xref)
 
-        for marker in page_images:
-            parts.append(marker)
+            for marker in page_markers:
+                parts.append(marker)
+    finally:
+        doc.close()
 
     full_text = "\n".join(parts).strip()
     if not full_text:
         raise ValueError("No text extracted from PDF file")
 
     if img_counter == 0:
-        images_dir.rmdir()
+        try:
+            images_dir.rmdir()
+        except OSError:
+            pass
 
     log.info("[%s] Extracted %d images from PDF", path.name, img_counter)
     return [Document(text=full_text, metadata={"filename": path.name})]
