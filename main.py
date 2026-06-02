@@ -1685,8 +1685,27 @@ def _extract_pdf_with_images(path: Path) -> list:
                 if not img_bytes:
                     continue
                 ext = base_image.get("ext", "png").lower().lstrip(".")
-                if ext not in ("png", "jpg", "jpeg", "gif", "bmp", "tiff", "webp"):
+                # Нормализуем формат через Pixmap: CMYK / Lab → RGB,
+                # убираем alpha-канал, пересохраняем как PNG sRGB без
+                # color profile. Иначе 1С (GDI+) часто рендерит CMYK JPEG
+                # и PNG с pre-multiplied alpha как чёрные прямоугольники.
+                try:
+                    pix = fitz.Pixmap(img_bytes)
+                    # n - alpha = число цветовых каналов; >3 значит CMYK или больше
+                    if pix.n - pix.alpha > 3:
+                        pix = fitz.Pixmap(fitz.csRGB, pix)
+                    if pix.alpha:
+                        pix = fitz.Pixmap(pix, 0)
+                    img_bytes = pix.tobytes("png")
                     ext = "png"
+                    pix = None
+                except Exception as e:
+                    log.warning(
+                        "[%s] Pixmap normalize failed for xref=%d: %s — saving raw",
+                        path.name, xref, e,
+                    )
+                    if ext not in ("png", "jpg", "jpeg", "gif", "bmp", "tiff", "webp"):
+                        ext = "png"
                 img_counter += 1
                 img_name = f"img_{img_counter:03d}.{ext}"
                 img_path = images_dir / img_name
