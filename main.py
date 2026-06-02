@@ -2380,9 +2380,16 @@ async def ask(req: AskRequest, request: Request):
 
         best_sim = 1 - distances[0]
         best_filename_score = filename_scores[0] if filename_scores else 0.0
-        log.info("Best similarity: %.3f (filename_score=%.3f)", best_sim, best_filename_score)
+        # distance ≥ 1.0 означает, что top-результат пришёл из BM25 (vector
+        # search его не нашёл) — это валидный лексический хит, к нему
+        # не применяем порог по vector similarity.
+        is_bm25_only = distances[0] >= 1.0
+        log.info(
+            "Best similarity: %.3f (filename_score=%.3f, bm25_only=%s)",
+            best_sim, best_filename_score, is_bm25_only,
+        )
         log_entry["best_similarity"] = round(float(best_sim), 4)
-        if best_sim < SIM_THRESHOLD and best_filename_score < 0.7:
+        if best_sim < SIM_THRESHOLD and best_filename_score < 0.7 and not is_bm25_only:
             log_entry["answer"] = _not_found
             return AskResponse(
                 answer=_not_found,
