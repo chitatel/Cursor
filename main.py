@@ -1682,58 +1682,54 @@ def _extract_pdf_with_images(path: Path) -> list:
             if page_text:
                 parts.append(page_text)
 
-            # Картинки страницы (по xref)
+            # Картинки страницы.  Вместо вытаскивания сырых байт через
+            # extract_image() рендерим участок страницы по bbox каждой
+            # картинки: PyMuPDF сам применяет soft masks, прозрачность,
+            # gradients — и отдаёт ровно то, что видно в PDF-вьюере.
+            # Для презентаций это единственный надёжный путь.
             try:
-                image_list = page.get_images(full=True)
+                image_info_list = page.get_image_info(xrefs=True)
             except Exception as e:
-                log.warning("[%s] page %d get_images failed: %s", path.name, page_num + 1, e)
-                image_list = []
+                log.warning("[%s] page %d get_image_info failed: %s",
+                            path.name, page_num + 1, e)
+                image_info_list = []
 
             page_markers: list[str] = []
-            for img_info in image_list:
-                xref = img_info[0]
+            zoom = fitz.Matrix(2, 2)  # 2x для читаемости текста на кнопках
+            for info in image_info_list:
+                xref = info.get("xref", 0)
+                if not isinstance(xref, int) or xref <= 0:
+                    continue
                 if xref in smask_xrefs:
-                    continue  # пропускаем soft masks
+                    continue  # этот xref — служебная маска для другой картинки
                 if xref in seen_xrefs:
                     page_markers.append(seen_xrefs[xref])
                     continue
-                try:
-                    base_image = doc.extract_image(xref)
-                except Exception as e:
-                    log.warning("[%s] page %d extract_image(xref=%d) failed: %s",
-                                path.name, page_num + 1, xref, e)
+                bbox = info.get("bbox")
+                if not bbox:
                     continue
-                img_bytes = base_image.get("image")
-                if not img_bytes:
-                    continue
-                ext = base_image.get("ext", "png").lower().lstrip(".")
-                # Нормализуем формат через Pixmap: CMYK / Lab → RGB sRGB.
-                # Альфа НЕ удаляем — иначе прозрачные пиксели становятся
-                # чёрными.  PNG с альфой 1С рендерит корректно через MSHTML.
                 try:
-                    pix = fitz.Pixmap(img_bytes)
-                    # n - alpha = число цветовых каналов; >3 значит CMYK или больше
-                    if pix.n - pix.alpha > 3:
-                        pix = fitz.Pixmap(fitz.csRGB, pix)
+                    clip_rect = fitz.Rect(bbox)
+                    if clip_rect.is_empty or clip_rect.is_infinite:
+                        continue
+                    pix = page.get_pixmap(matrix=zoom, clip=clip_rect, alpha=False)
                     img_bytes = pix.tobytes("png")
-                    ext = "png"
                     pix = None
                 except Exception as e:
-                    log.warning(
-                        "[%s] Pixmap normalize failed for xref=%d: %s — saving raw",
-                        path.name, xref, e,
-                    )
-                    if ext not in ("png", "jpg", "jpeg", "gif", "bmp", "tiff", "webp"):
-                        ext = "png"
+                    log.warning("[%s] page %d render at xref=%d failed: %s",
+                                path.name, page_num + 1, xref, e)
+                    continue
+
                 img_counter += 1
-                img_name = f"img_{img_counter:03d}.{ext}"
+                img_name = f"img_{img_counter:03d}.png"
                 img_path = images_dir / img_name
                 img_path.write_bytes(img_bytes)
                 marker = f"[Рисунок {img_counter}: {img_name}]"
                 seen_xrefs[xref] = marker
                 page_markers.append(marker)
-                log.info("[%s] Extracted image from page %d: %s (xref=%d)",
-                         path.name, page_num + 1, img_name, xref)
+                log.info("[%s] Rendered image from page %d: %s (xref=%d, bbox=%s)",
+                         path.name, page_num + 1, img_name, xref,
+                         tuple(round(v, 1) for v in bbox))
 
             for marker in page_markers:
                 parts.append(marker)
