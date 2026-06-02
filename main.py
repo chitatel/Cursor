@@ -1739,14 +1739,25 @@ def _extract_pdf_with_images(path: Path) -> list:
             page_markers: list[str] = []
             zoom = fitz.Matrix(2, 2)  # 2x для читаемости текста
 
-            # Шаг 2: выбор стратегии.
-            # Если на странице много картинок (>=5) — это, скорее всего, слайд
-            # презентации.  Рендерим всю страницу как одну картинку: пользователю
-            # полезнее видеть слайд целиком, чем россыпь декоративных кусочков.
-            # Для документных страниц (мало картинок — обычно скриншоты в
-            # инструкции) рендерим каждую отдельно как раньше.
-            PRESENTATION_THRESHOLD = 5
-            if len(candidates) >= PRESENTATION_THRESHOLD:
+            # Шаг 2: выбор стратегии — слайд или документ?
+            # Слайд презентации:
+            #   - либо много визуальных элементов (≥4),
+            #   - либо мало текста (<500 символов) + хотя бы одна крупная
+            #     картинка (>15% площади) — это «титульный» слайд с большой
+            #     декоративной иллюстрацией (как стр.2 FAQ с большой монетой)
+            # Для слайдов рендерим всю страницу как одну картинку.
+            # Для документных страниц (инструкция с парой скриншотов) —
+            # каждую картинку отдельно.
+            has_large_image = any(
+                (b[2] - b[0]) * (b[3] - b[1]) > 0.15 * page_area
+                for _, b in candidates
+            ) if page_area > 0 else False
+            page_text_len = len(page_text)
+            is_presentation = (
+                len(candidates) >= 4
+                or (page_text_len < 500 and has_large_image)
+            )
+            if is_presentation:
                 try:
                     page_rect = page.rect
                     pix = page.get_pixmap(matrix=zoom, clip=page_rect, alpha=False)
@@ -1759,8 +1770,9 @@ def _extract_pdf_with_images(path: Path) -> list:
                     marker = f"[Рисунок {img_counter}: {img_name}]"
                     page_markers.append(marker)
                     log.info(
-                        "[%s] page %d: presentation mode (%d candidates) → 1 full-page render: %s",
-                        path.name, page_num + 1, len(candidates), img_name,
+                        "[%s] page %d: presentation mode (cands=%d, text=%d, big_img=%s) → 1 full-page render: %s",
+                        path.name, page_num + 1, len(candidates),
+                        page_text_len, has_large_image, img_name,
                     )
                 except Exception as e:
                     log.warning("[%s] page %d full-page render failed: %s",
