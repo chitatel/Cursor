@@ -1694,24 +1694,65 @@ def _extract_pdf_with_images(path: Path) -> list:
                             path.name, page_num + 1, e)
                 image_info_list = []
 
-            page_markers: list[str] = []
-            zoom = fitz.Matrix(2, 2)  # 2x для читаемости текста на кнопках
+            # Шаг 1: собираем кандидатов с базовыми фильтрами
+            #   - живой xref
+            #   - не soft mask
+            #   - не «иконка» (минимум 50 PDF-points по обеим сторонам)
+            candidates: list[tuple[int, tuple]] = []
             for info in image_info_list:
                 xref = info.get("xref", 0)
                 if not isinstance(xref, int) or xref <= 0:
                     continue
                 if xref in smask_xrefs:
-                    continue  # этот xref — служебная маска для другой картинки
+                    continue
+                bbox = info.get("bbox")
+                if not bbox or len(bbox) < 4:
+                    continue
+                try:
+                    rect = fitz.Rect(bbox)
+                    if rect.is_empty or rect.is_infinite:
+                        continue
+                    if rect.width < 50 and rect.height < 50:
+                        continue  # декоративная иконка
+                except Exception:
+                    continue
+                candidates.append((xref, tuple(bbox)))
+
+            # Шаг 2: containment-фильтр.  Если bbox A целиком внутри bbox B
+            # и A заметно меньше — A это суб-элемент B (например, монетка
+            # внутри круга-фона), B уже покажет всё содержимое.
+            def _contained(inner: tuple, outer: tuple) -> bool:
+                margin = 1.0
+                inner_area = (inner[2] - inner[0]) * (inner[3] - inner[1])
+                outer_area = (outer[2] - outer[0]) * (outer[3] - outer[1])
+                return (
+                    inner[0] >= outer[0] - margin
+                    and inner[1] >= outer[1] - margin
+                    and inner[2] <= outer[2] + margin
+                    and inner[3] <= outer[3] + margin
+                    and inner_area < outer_area * 0.95
+                )
+
+            filtered: list[tuple[int, tuple]] = []
+            for i, (xref_i, bbox_i) in enumerate(candidates):
+                is_inside = False
+                for j, (_, bbox_j) in enumerate(candidates):
+                    if i == j:
+                        continue
+                    if _contained(bbox_i, bbox_j):
+                        is_inside = True
+                        break
+                if not is_inside:
+                    filtered.append((xref_i, bbox_i))
+
+            page_markers: list[str] = []
+            zoom = fitz.Matrix(2, 2)  # 2x для читаемости текста на кнопках
+            for xref, bbox in filtered:
                 if xref in seen_xrefs:
                     page_markers.append(seen_xrefs[xref])
                     continue
-                bbox = info.get("bbox")
-                if not bbox:
-                    continue
                 try:
                     clip_rect = fitz.Rect(bbox)
-                    if clip_rect.is_empty or clip_rect.is_infinite:
-                        continue
                     pix = page.get_pixmap(matrix=zoom, clip=clip_rect, alpha=False)
                     img_bytes = pix.tobytes("png")
                     pix = None
@@ -1730,6 +1771,10 @@ def _extract_pdf_with_images(path: Path) -> list:
                 log.info("[%s] Rendered image from page %d: %s (xref=%d, bbox=%s)",
                          path.name, page_num + 1, img_name, xref,
                          tuple(round(v, 1) for v in bbox))
+
+            if image_info_list:
+                log.info("[%s] page %d: %d images → %d after filters",
+                         path.name, page_num + 1, len(image_info_list), len(filtered))
 
             for marker in page_markers:
                 parts.append(marker)
