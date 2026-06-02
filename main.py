@@ -1653,6 +1653,26 @@ def _extract_pdf_with_images(path: Path) -> list:
     parts: list[str] = []
     seen_xrefs: dict[int, str] = {}  # один и тот же xref на разных страницах → один маркер
 
+    # Pass 1: собираем xref-ы, которые используются как soft masks для других
+    # изображений.  Soft mask — это служебная картинка, описывающая прозрачность
+    # основной; вытащенная отдельно, выглядит как чёрный прямоугольник и не
+    # имеет самостоятельного смысла.
+    smask_xrefs: set[int] = set()
+    try:
+        for page_num in range(len(doc)):
+            page = doc[page_num]
+            try:
+                for img_info in page.get_images(full=True):
+                    smask_xref = img_info[1] if len(img_info) > 1 else 0
+                    if smask_xref:
+                        smask_xrefs.add(int(smask_xref))
+            except Exception:
+                continue
+    except Exception:
+        pass
+    if smask_xrefs:
+        log.info("[%s] detected %d soft masks, will skip them", path.name, len(smask_xrefs))
+
     try:
         for page_num in range(len(doc)):
             page = doc[page_num]
@@ -1672,6 +1692,8 @@ def _extract_pdf_with_images(path: Path) -> list:
             page_markers: list[str] = []
             for img_info in image_list:
                 xref = img_info[0]
+                if xref in smask_xrefs:
+                    continue  # пропускаем soft masks
                 if xref in seen_xrefs:
                     page_markers.append(seen_xrefs[xref])
                     continue
@@ -1685,17 +1707,14 @@ def _extract_pdf_with_images(path: Path) -> list:
                 if not img_bytes:
                     continue
                 ext = base_image.get("ext", "png").lower().lstrip(".")
-                # Нормализуем формат через Pixmap: CMYK / Lab → RGB,
-                # убираем alpha-канал, пересохраняем как PNG sRGB без
-                # color profile. Иначе 1С (GDI+) часто рендерит CMYK JPEG
-                # и PNG с pre-multiplied alpha как чёрные прямоугольники.
+                # Нормализуем формат через Pixmap: CMYK / Lab → RGB sRGB.
+                # Альфа НЕ удаляем — иначе прозрачные пиксели становятся
+                # чёрными.  PNG с альфой 1С рендерит корректно через MSHTML.
                 try:
                     pix = fitz.Pixmap(img_bytes)
                     # n - alpha = число цветовых каналов; >3 значит CMYK или больше
                     if pix.n - pix.alpha > 3:
                         pix = fitz.Pixmap(fitz.csRGB, pix)
-                    if pix.alpha:
-                        pix = fitz.Pixmap(pix, 0)
                     img_bytes = pix.tobytes("png")
                     ext = "png"
                     pix = None
