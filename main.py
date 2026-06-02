@@ -1698,6 +1698,8 @@ def _extract_pdf_with_images(path: Path) -> list:
             #   - живой xref
             #   - не soft mask
             #   - не «иконка» (минимум 50 PDF-points по обеим сторонам)
+            #   - не «крупная декорация» (>30% страницы без текста сверху)
+            page_area = page.rect.width * page.rect.height
             candidates: list[tuple[int, tuple]] = []
             for info in image_info_list:
                 xref = info.get("xref", 0)
@@ -1714,6 +1716,22 @@ def _extract_pdf_with_images(path: Path) -> list:
                         continue
                     if rect.width < 50 and rect.height < 50:
                         continue  # декоративная иконка
+                    # Крупная картинка без текста сверху — декорация (титульная
+                    # иллюстрация, фон).  Картинки с текстом-наложением
+                    # (кнопки, плашки, иконки с подписями) проходят фильтр.
+                    img_area = rect.width * rect.height
+                    if page_area > 0 and img_area / page_area > 0.30:
+                        try:
+                            text_over = page.get_text(clip=rect).strip()
+                        except Exception:
+                            text_over = ""
+                        if not text_over:
+                            log.info(
+                                "[%s] page %d skip decorative xref=%d (%.0f%% area, no text)",
+                                path.name, page_num + 1, xref,
+                                100.0 * img_area / page_area,
+                            )
+                            continue
                 except Exception:
                     continue
                 candidates.append((xref, tuple(bbox)))
