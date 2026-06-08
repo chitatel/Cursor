@@ -1974,13 +1974,29 @@ async def _fetch_kb_article(url: str) -> tuple[str, str]:
 
         soup = BeautifulSoup(html, "html.parser")
 
-        # Title — берём из #pg-head (на портале это заголовок статьи)
+        # Title — внутри #pg-head лежит и кнопка «← Назад» (тег <a>),
+        # и собственно заголовок статьи.  Убираем <a> ссылки и навигацию
+        # перед извлечением текста — иначе title начинается со слова «Назад».
+        title = ""
         title_el = soup.select_one("#pg-head")
-        if title_el and title_el.get_text(strip=True):
+        if title_el:
+            # Копию делать не нужно: мы потом всё равно удаляем #pg-head
+            # из body_el (см. блок чистки ниже), так что портим эту копию
+            for nav in title_el.find_all(["a", "button", "nav"]):
+                nav.decompose()
             title = title_el.get_text(separator=" ", strip=True)
-        else:
+        if not title:
+            # Фоллбэк: первый h1/h2 в основном контенте, потом <title>
+            for sel in ("#kb-b-container h1", "#kb-b-container h2", "h1"):
+                el = soup.select_one(sel)
+                if el and el.get_text(strip=True):
+                    title = el.get_text(separator=" ", strip=True)
+                    break
+        if not title:
             title_tag = soup.find("title")
             title = title_tag.get_text(strip=True) if title_tag else "kb_article"
+        # На случай если «Назад» где-то всё ещё в начале — режем
+        title = re.sub(r"^(←\s*)?Назад\s+", "", title).strip() or "kb_article"
 
         # Body — основной контент в #kb-b-container
         body_el = soup.select_one("#kb-b-container")
