@@ -98,6 +98,9 @@ OPENWEBUI_PASSWORD = _config_value("OPENWEBUI_PASSWORD")
 KB_PORTAL_BASE_URL = str(CONFIG.get("KB_PORTAL_BASE_URL", "")).rstrip("/")
 KB_PORTAL_USER = str(CONFIG.get("KB_PORTAL_USER", ""))
 KB_PORTAL_PASSWORD = str(CONFIG.get("KB_PORTAL_PASSWORD", ""))
+# Проверять SSL-сертификат портала?  Если у портала самоподписанный или
+# подписанный внутренним корпоративным CA сертификат — поставить false.
+KB_PORTAL_VERIFY_SSL = bool(CONFIG.get("KB_PORTAL_VERIFY_SSL", True))
 
 # Размер батча для эмбеддингов при индексировании
 EMBED_BATCH_SIZE = int(CONFIG.get("EMBED_BATCH_SIZE", 32))
@@ -1930,6 +1933,7 @@ async def _fetch_kb_article(url: str) -> tuple[str, str]:
         auth=auth,
         timeout=60,
         follow_redirects=True,
+        verify=KB_PORTAL_VERIFY_SSL,
     ) as client:
         response = await client.get(url)
         if response.status_code == 401:
