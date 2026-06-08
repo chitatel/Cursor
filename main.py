@@ -94,6 +94,11 @@ OPENWEBUI_AUTH_PATH = _config_value("OPENWEBUI_AUTH_PATH")
 OPENWEBUI_USER = _config_value("OPENWEBUI_USER")
 OPENWEBUI_PASSWORD = _config_value("OPENWEBUI_PASSWORD")
 
+# Корпоративная База знаний (HTTP Basic Auth, Apache mod_auth)
+KB_PORTAL_BASE_URL = str(CONFIG.get("KB_PORTAL_BASE_URL", "")).rstrip("/")
+KB_PORTAL_USER = str(CONFIG.get("KB_PORTAL_USER", ""))
+KB_PORTAL_PASSWORD = str(CONFIG.get("KB_PORTAL_PASSWORD", ""))
+
 # Размер батча для эмбеддингов при индексировании
 EMBED_BATCH_SIZE = int(CONFIG.get("EMBED_BATCH_SIZE", 32))
 # Максимум записей, которое отдаёт GET /logs за один запрос
@@ -1898,6 +1903,89 @@ def _detect_chunk_profile(texts: list[str]) -> tuple[str, int, int]:
     return ("manual", 800, 120)
 
 
+# ── Загрузка статей из корпоративной Базы знаний ─────────────────────────────
+
+async def _fetch_kb_article(url: str) -> tuple[str, str]:
+    """
+    Скачивает статью с портала Базы знаний (Yii + Apache Basic Auth).
+    Возвращает (title, markdown_text).
+
+    Авторизация через HTTP Basic — учётка прописана в KB_PORTAL_USER/PASSWORD.
+    Apache на портале анонсирует и Negotiate (Kerberos), и Basic — мы идём
+    по Basic-пути, потому что Negotiate требует ticket'ов AD на стороне Linux.
+    """
+    if not KB_PORTAL_USER or not KB_PORTAL_PASSWORD:
+        raise RuntimeError(
+            "KB_PORTAL_USER and KB_PORTAL_PASSWORD must be configured in config.json"
+        )
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError as e:
+        raise RuntimeError(
+            "KB article support requires beautifulsoup4: pip install beautifulsoup4"
+        ) from e
+
+    auth = (KB_PORTAL_USER, KB_PORTAL_PASSWORD)
+    async with httpx.AsyncClient(
+        auth=auth,
+        timeout=60,
+        follow_redirects=True,
+    ) as client:
+        response = await client.get(url)
+        if response.status_code == 401:
+            raise ValueError(
+                "Portal returned 401: wrong KB_PORTAL_USER/KB_PORTAL_PASSWORD"
+            )
+        response.raise_for_status()
+        html = response.text
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    # Title — берём из #pg-head (на портале это заголовок статьи)
+    title_el = soup.select_one("#pg-head")
+    if title_el and title_el.get_text(strip=True):
+        title = title_el.get_text(separator=" ", strip=True)
+    else:
+        title_tag = soup.find("title")
+        title = title_tag.get_text(strip=True) if title_tag else "kb_article"
+
+    # Body — основной контент в #kb-b-container
+    body_el = soup.select_one("#kb-b-container")
+    if not body_el:
+        body_el = soup.select_one("#kb-container") or soup.select_one("main")
+    if not body_el:
+        raise ValueError(
+            "Could not locate article body (#kb-b-container) in response HTML"
+        )
+
+    # Чистим тело: скрипты, стили, навигация, banner — это не контент
+    for tag in body_el.select(
+        "script, style, nav, .breadcrumb, #banner-cont, #pg-head"
+    ):
+        tag.decompose()
+
+    # Извлекаем текст с сохранением переносов параграфов
+    text = body_el.get_text(separator="\n", strip=True)
+    # Сжимаем подряд идущие пустые строки в одну
+    text = re.sub(r"\n[ \t]*\n+", "\n\n", text).strip()
+
+    if not text:
+        raise ValueError("Article body is empty after extraction")
+
+    # Собираем итоговый markdown: заголовок + тело
+    markdown = f"# {title}\n\n{text}\n"
+    return title, markdown
+
+
+def _safe_title_to_filename(title: str) -> str:
+    """Превращает заголовок статьи в безопасное имя файла."""
+    cleaned = re.sub(r"[<>:\"/\\|?*\n\r\t]+", " ", title).strip()
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    if not cleaned:
+        cleaned = f"kb_article_{int(time.time())}"
+    return cleaned[:200]
+
+
 # ── Индексирование ────────────────────────────────────────────────────────────
 
 async def _run_indexing(filename: str, dest: Path, category: Optional[str] = None):
@@ -2071,6 +2159,11 @@ class CategoryUpdateRequest(BaseModel):
     category: Optional[str] = None
 
 
+class LoadFromUrlRequest(BaseModel):
+    url: str
+    category: Optional[str] = None
+
+
 class IndexingStatus(BaseModel):
     filename: str
     status: str
@@ -2172,6 +2265,43 @@ async def upload_document(
         while chunk := await file.read(1024 * 256):
             await f.write(chunk)
     norm_cat = _normalize_category(category)
+    background_tasks.add_task(_run_indexing, filename, dest, norm_cat)
+    return UploadResponse(filename=filename, status="indexing_started", category=norm_cat)
+
+
+@app.post("/documents/from-url", response_model=UploadResponse, status_code=202)
+async def upload_from_url(background_tasks: BackgroundTasks, body: LoadFromUrlRequest):
+    """
+    Скачивает статью с корпоративной Базы знаний по URL, сохраняет как
+    markdown-файл и запускает индексацию.  Авторизация на портале — HTTP Basic
+    с учёткой из config.json (KB_PORTAL_USER / KB_PORTAL_PASSWORD).
+    """
+    url = (body.url or "").strip()
+    if not url.startswith(("http://", "https://")):
+        raise HTTPException(400, "url must start with http:// or https://")
+
+    try:
+        title, markdown = await _fetch_kb_article(url)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(502, f"Portal returned HTTP {e.response.status_code}")
+    except httpx.RequestError as e:
+        raise HTTPException(502, f"Could not reach portal: {e}")
+    except RuntimeError as e:
+        raise HTTPException(500, str(e))
+
+    safe_title = _safe_title_to_filename(title)
+    filename = _safe_filename(f"{safe_title}.md")
+    if _indexing.get(filename, {}).get("status") == "indexing":
+        raise HTTPException(409, f"'{filename}' is already being indexed")
+
+    dest = FILES_DIR / filename
+    async with aiofiles.open(dest, "w", encoding="utf-8") as f:
+        await f.write(markdown)
+    log.info("Saved KB article from %s → %s (%d chars)", url, filename, len(markdown))
+
+    norm_cat = _normalize_category(body.category)
     background_tasks.add_task(_run_indexing, filename, dest, norm_cat)
     return UploadResponse(filename=filename, status="indexing_started", category=norm_cat)
 
