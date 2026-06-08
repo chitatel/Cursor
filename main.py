@@ -1908,6 +1908,28 @@ def _detect_chunk_profile(texts: list[str]) -> tuple[str, int, int]:
 
 # ── Загрузка статей из корпоративной Базы знаний ─────────────────────────────
 
+_IMG_CONTENT_TYPE_TO_EXT = {
+    "image/png": "png",
+    "image/jpeg": "jpg",
+    "image/jpg": "jpg",
+    "image/gif": "gif",
+    "image/webp": "webp",
+    "image/bmp": "bmp",
+    "image/svg+xml": "svg",
+}
+
+
+def _ext_from_image_response(url: str, content_type: str) -> str:
+    """Возвращает расширение картинки по content-type, с fallback на URL."""
+    ct = (content_type or "").split(";", 1)[0].strip().lower()
+    if ct in _IMG_CONTENT_TYPE_TO_EXT:
+        return _IMG_CONTENT_TYPE_TO_EXT[ct]
+    suffix = Path(url.split("?", 1)[0]).suffix.lstrip(".").lower()
+    if suffix in {"png", "jpg", "jpeg", "gif", "webp", "bmp", "svg"}:
+        return "jpg" if suffix == "jpeg" else suffix
+    return "png"
+
+
 async def _fetch_kb_article(url: str) -> tuple[str, str]:
     """
     Скачивает статью с портала Базы знаний (Yii + Apache Basic Auth).
@@ -1916,6 +1938,12 @@ async def _fetch_kb_article(url: str) -> tuple[str, str]:
     Авторизация через HTTP Basic — учётка прописана в KB_PORTAL_USER/PASSWORD.
     Apache на портале анонсирует и Negotiate (Kerberos), и Basic — мы идём
     по Basic-пути, потому что Negotiate требует ticket'ов AD на стороне Linux.
+
+    Картинки из <img> качаются с теми же кредами и сохраняются в папку
+    storage/files/<stem>_images/ с именами img_001.png и т.д.  В markdown
+    на месте <img> вставляется маркер [Рисунок N: img_NNN.ext] — тот же
+    формат, что используется для PDF/DOCX, чтобы существующая логика
+    привязки картинок к ответам отработала автоматически.
     """
     if not KB_PORTAL_USER or not KB_PORTAL_PASSWORD:
         raise RuntimeError(
@@ -1927,6 +1955,7 @@ async def _fetch_kb_article(url: str) -> tuple[str, str]:
         raise RuntimeError(
             "KB article support requires beautifulsoup4: pip install beautifulsoup4"
         ) from e
+    from urllib.parse import urljoin
 
     auth = (KB_PORTAL_USER, KB_PORTAL_PASSWORD)
     async with httpx.AsyncClient(
@@ -1943,38 +1972,76 @@ async def _fetch_kb_article(url: str) -> tuple[str, str]:
         response.raise_for_status()
         html = response.text
 
-    soup = BeautifulSoup(html, "html.parser")
+        soup = BeautifulSoup(html, "html.parser")
 
-    # Title — берём из #pg-head (на портале это заголовок статьи)
-    title_el = soup.select_one("#pg-head")
-    if title_el and title_el.get_text(strip=True):
-        title = title_el.get_text(separator=" ", strip=True)
-    else:
-        title_tag = soup.find("title")
-        title = title_tag.get_text(strip=True) if title_tag else "kb_article"
+        # Title — берём из #pg-head (на портале это заголовок статьи)
+        title_el = soup.select_one("#pg-head")
+        if title_el and title_el.get_text(strip=True):
+            title = title_el.get_text(separator=" ", strip=True)
+        else:
+            title_tag = soup.find("title")
+            title = title_tag.get_text(strip=True) if title_tag else "kb_article"
 
-    # Body — основной контент в #kb-b-container
-    body_el = soup.select_one("#kb-b-container")
-    if not body_el:
-        body_el = soup.select_one("#kb-container") or soup.select_one("main")
-    if not body_el:
-        raise ValueError(
-            "Could not locate article body (#kb-b-container) in response HTML"
-        )
+        # Body — основной контент в #kb-b-container
+        body_el = soup.select_one("#kb-b-container")
+        if not body_el:
+            body_el = soup.select_one("#kb-container") or soup.select_one("main")
+        if not body_el:
+            raise ValueError(
+                "Could not locate article body (#kb-b-container) in response HTML"
+            )
 
-    # Чистим тело: скрипты, стили, навигация, banner — это не контент
-    for tag in body_el.select(
-        "script, style, nav, .breadcrumb, #banner-cont, #pg-head"
-    ):
-        tag.decompose()
+        # Чистим тело: скрипты, стили, навигация, banner — это не контент
+        for tag in body_el.select(
+            "script, style, nav, .breadcrumb, #banner-cont, #pg-head"
+        ):
+            tag.decompose()
 
-    # Извлекаем текст с сохранением переносов параграфов
+        # Скачиваем картинки и заменяем <img> на маркеры.
+        # Папка-имя должна совпадать с тем, что вычислит upload_from_url
+        # (она же используется эндпоинтом /documents/{filename}/images/...).
+        stem = _safe_title_to_filename(title)
+        images_dir = FILES_DIR / f"{stem}_images"
+        img_counter = 0
+
+        for img in list(body_el.find_all("img")):
+            src = (img.get("src") or "").strip()
+            if not src or src.startswith("data:"):
+                img.decompose()
+                continue
+            img_url = urljoin(url, src)
+            if not img_url.startswith(("http://", "https://")):
+                img.decompose()
+                continue
+            try:
+                img_resp = await client.get(img_url)
+                img_resp.raise_for_status()
+            except Exception as e:
+                log.warning("[KB] could not fetch image %s: %s", img_url, e)
+                img.decompose()
+                continue
+            if img_counter == 0:
+                images_dir.mkdir(exist_ok=True)
+            img_counter += 1
+            ext = _ext_from_image_response(
+                img_url, img_resp.headers.get("content-type", "")
+            )
+            img_name = f"img_{img_counter:03d}.{ext}"
+            (images_dir / img_name).write_bytes(img_resp.content)
+            marker = f"[Рисунок {img_counter}: {img_name}]"
+            img.replace_with(marker)
+            log.info("[KB] saved image %s ← %s", img_name, img_url)
+
+    # Извлекаем текст с сохранением переносов параграфов.
+    # img'и уже заменены на текстовые маркеры → попадают в текст естественно.
     text = body_el.get_text(separator="\n", strip=True)
     # Сжимаем подряд идущие пустые строки в одну
     text = re.sub(r"\n[ \t]*\n+", "\n\n", text).strip()
 
     if not text:
         raise ValueError("Article body is empty after extraction")
+
+    log.info("[KB] extracted %d chars, %d images from %s", len(text), img_counter, url)
 
     # Собираем итоговый markdown: заголовок + тело
     markdown = f"# {title}\n\n{text}\n"
