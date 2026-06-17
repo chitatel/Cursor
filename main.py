@@ -2416,6 +2416,15 @@ async def upload_from_url(background_tasks: BackgroundTasks, body: LoadFromUrlRe
     if not url.startswith(("http://", "https://")):
         raise HTTPException(400, "url must start with http:// or https://")
 
+    # ВАЖНО: сначала удаляем старую версию (вместе с её папкой картинок),
+    # ТОЛЬКО ПОТОМ скачиваем новую — иначе _remove_existing_kb_article
+    # снесёт свежескачанную папку kb_<pid>_..._images.
+    pid = _extract_pid_from_url(url)
+    if pid is not None:
+        removed = await _remove_existing_kb_article(pid)
+        if removed:
+            log.info("[KB] replaced %d previous version(s) of pid=%d", removed, pid)
+
     try:
         title, markdown = await _fetch_kb_article(url)
     except ValueError as e:
@@ -2427,14 +2436,7 @@ async def upload_from_url(background_tasks: BackgroundTasks, body: LoadFromUrlRe
     except RuntimeError as e:
         raise HTTPException(500, str(e))
 
-    # Если URL содержит pid — используем стабильное имя kb_<pid>_<title>.md
-    # и предварительно удаляем старую версию, чтобы при изменении заголовка
-    # статьи в портале не появлялся дубль файла в индексе.
-    pid = _extract_pid_from_url(url)
     if pid is not None:
-        removed = await _remove_existing_kb_article(pid)
-        if removed:
-            log.info("[KB] replaced %d previous version(s) of pid=%d", removed, pid)
         filename = _safe_filename(_kb_filename_for_pid(pid, title))
     else:
         safe_title = _safe_title_to_filename(title)
@@ -2470,6 +2472,13 @@ async def _bulk_import_kb_articles(
     failed = 0
     for pid in range(pid_min, pid_max + 1):
         url = f"{base}/kb/single?pid={pid}"
+        # ВАЖНО: сначала удаляем старую версию (вместе с папкой картинок),
+        # потом скачиваем новую — иначе _remove_existing_kb_article снесёт
+        # свежескачанную папку kb_<pid>_..._images.
+        try:
+            await _remove_existing_kb_article(pid)
+        except Exception as e:
+            log.warning("[KB bulk] pid=%d remove-old error: %s", pid, e)
         try:
             title, markdown = await _fetch_kb_article(url)
         except ValueError as e:
@@ -2489,8 +2498,7 @@ async def _bulk_import_kb_articles(
             failed += 1
         else:
             try:
-                # Стабильное имя kb_<pid>_<title>.md + замена старой версии
-                await _remove_existing_kb_article(pid)
+                # Стабильное имя kb_<pid>_<title>.md
                 filename = _safe_filename(_kb_filename_for_pid(pid, title))
                 if _indexing.get(filename, {}).get("status") == "indexing":
                     log.info("[KB bulk] pid=%d already indexing %s, skip", pid, filename)
