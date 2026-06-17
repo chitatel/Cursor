@@ -2073,6 +2073,49 @@ def _safe_title_to_filename(title: str) -> str:
     return cleaned[:200]
 
 
+def _extract_pid_from_url(url: str) -> Optional[int]:
+    """Достаёт pid из URL вида .../kb/single?pid=189 — стабильный ID статьи."""
+    m = re.search(r"[?&]pid=(\d+)", url)
+    return int(m.group(1)) if m else None
+
+
+def _kb_filename_for_pid(pid: int, title: str) -> str:
+    """
+    Имя файла для статьи Базы знаний.  Префикс kb_<pid>_ — стабильный ключ,
+    не зависит от заголовка.  При переименовании статьи на портале pid тот же,
+    поэтому старый файл легко найти по glob и заменить.
+    """
+    safe_title = _safe_title_to_filename(title)
+    return f"kb_{pid:04d}_{safe_title}.md"
+
+
+async def _remove_existing_kb_article(pid: int) -> int:
+    """
+    Удаляет любой существующий файл (и связанные с ним записи индекса
+    и папку картинок) для статьи с этим pid.  Возвращает число удалённых файлов.
+    """
+    removed = 0
+    for old_file in FILES_DIR.glob(f"kb_{pid:04d}_*.md"):
+        log.info("[KB] removing previous version of pid=%d: %s", pid, old_file.name)
+        try:
+            await _delete_document_records(old_file.name)
+        except Exception as e:
+            log.warning("[KB] could not remove index records for %s: %s", old_file.name, e)
+        try:
+            old_file.unlink(missing_ok=True)
+        except Exception as e:
+            log.warning("[KB] could not unlink %s: %s", old_file, e)
+        old_images = FILES_DIR / f"{old_file.stem}_images"
+        if old_images.is_dir():
+            try:
+                shutil.rmtree(old_images, ignore_errors=True)
+            except Exception as e:
+                log.warning("[KB] could not rmtree %s: %s", old_images, e)
+        _indexing.pop(old_file.name, None)
+        removed += 1
+    return removed
+
+
 # ── Индексирование ────────────────────────────────────────────────────────────
 
 async def _run_indexing(filename: str, dest: Path, category: Optional[str] = None):
@@ -2378,8 +2421,19 @@ async def upload_from_url(background_tasks: BackgroundTasks, body: LoadFromUrlRe
     except RuntimeError as e:
         raise HTTPException(500, str(e))
 
-    safe_title = _safe_title_to_filename(title)
-    filename = _safe_filename(f"{safe_title}.md")
+    # Если URL содержит pid — используем стабильное имя kb_<pid>_<title>.md
+    # и предварительно удаляем старую версию, чтобы при изменении заголовка
+    # статьи в портале не появлялся дубль файла в индексе.
+    pid = _extract_pid_from_url(url)
+    if pid is not None:
+        removed = await _remove_existing_kb_article(pid)
+        if removed:
+            log.info("[KB] replaced %d previous version(s) of pid=%d", removed, pid)
+        filename = _safe_filename(_kb_filename_for_pid(pid, title))
+    else:
+        safe_title = _safe_title_to_filename(title)
+        filename = _safe_filename(f"{safe_title}.md")
+
     if _indexing.get(filename, {}).get("status") == "indexing":
         raise HTTPException(409, f"'{filename}' is already being indexed")
 
@@ -2391,6 +2445,99 @@ async def upload_from_url(background_tasks: BackgroundTasks, body: LoadFromUrlRe
     norm_cat = _normalize_category(body.category)
     background_tasks.add_task(_run_indexing, filename, dest, norm_cat)
     return UploadResponse(filename=filename, status="indexing_started", category=norm_cat)
+
+
+async def _bulk_import_kb_articles(
+    pid_min: int,
+    pid_max: int,
+    category: Optional[str],
+) -> None:
+    """
+    Фоновая задача: перебирает pid от pid_min до pid_max включительно,
+    скачивает каждую существующую статью и ставит на индексацию.
+    Несуществующие pid'ы (404 / 401 / редиректы на /kb/pg) пропускаются.
+    """
+    log.info("[KB bulk] starting brute-force import pid=%d..%d", pid_min, pid_max)
+    base = KB_PORTAL_BASE_URL.rstrip("/")
+    started = 0
+    skipped = 0
+    failed = 0
+    for pid in range(pid_min, pid_max + 1):
+        url = f"{base}/kb/single?pid={pid}"
+        try:
+            title, markdown = await _fetch_kb_article(url)
+        except ValueError as e:
+            # пустое тело, нет #kb-b-container и т.п. — нет такого pid
+            skipped += 1
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code in (401, 403, 404):
+                skipped += 1
+            else:
+                log.warning("[KB bulk] pid=%d HTTP %d", pid, e.response.status_code)
+                failed += 1
+        except httpx.RequestError as e:
+            log.warning("[KB bulk] pid=%d network error: %s", pid, e)
+            failed += 1
+        except Exception as e:
+            log.warning("[KB bulk] pid=%d unexpected: %s", pid, e)
+            failed += 1
+        else:
+            try:
+                # Стабильное имя kb_<pid>_<title>.md + замена старой версии
+                await _remove_existing_kb_article(pid)
+                filename = _safe_filename(_kb_filename_for_pid(pid, title))
+                if _indexing.get(filename, {}).get("status") == "indexing":
+                    log.info("[KB bulk] pid=%d already indexing %s, skip", pid, filename)
+                    skipped += 1
+                else:
+                    dest = FILES_DIR / filename
+                    async with aiofiles.open(dest, "w", encoding="utf-8") as f:
+                        await f.write(markdown)
+                    # fire-and-forget — не блокируемся на индексации
+                    asyncio.create_task(_run_indexing(filename, dest, category))
+                    started += 1
+                    log.info("[KB bulk] pid=%d saved → %s", pid, filename)
+            except Exception as e:
+                log.warning("[KB bulk] pid=%d save error: %s", pid, e)
+                failed += 1
+
+        # быть вежливыми к порталу
+        await asyncio.sleep(0.3)
+
+    log.info(
+        "[KB bulk] done: pid=%d..%d, started=%d, skipped=%d, failed=%d",
+        pid_min, pid_max, started, skipped, failed,
+    )
+
+
+class BulkImportRequest(BaseModel):
+    pid_min: int = 1
+    pid_max: int = 500
+    category: Optional[str] = None
+
+
+@app.post("/documents/from-portal-bulk", status_code=202)
+async def upload_from_portal_bulk(
+    background_tasks: BackgroundTasks, body: BulkImportRequest
+):
+    """
+    Запускает фоновый импорт всех статей с корпоративной Базы знаний.
+    Перебирает pid от pid_min до pid_max, скачивает существующие статьи
+    и ставит на индексацию.  Возвращается сразу с 202; прогресс — в логе.
+    """
+    if body.pid_min < 1 or body.pid_max < body.pid_min or body.pid_max > 10_000:
+        raise HTTPException(400, "pid_min/pid_max must satisfy 1 ≤ min ≤ max ≤ 10000")
+
+    norm_cat = _normalize_category(body.category)
+    background_tasks.add_task(
+        _bulk_import_kb_articles, body.pid_min, body.pid_max, norm_cat,
+    )
+    return {
+        "status": "bulk_import_started",
+        "pid_min": body.pid_min,
+        "pid_max": body.pid_max,
+        "category": norm_cat,
+    }
 
 
 @app.post("/documents/prepare", response_model=PrepareResponse)
