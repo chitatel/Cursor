@@ -2016,7 +2016,13 @@ async def _fetch_kb_article(url: str) -> tuple[str, str]:
         # Скачиваем картинки и заменяем <img> на маркеры.
         # Папка-имя должна совпадать с тем, что вычислит upload_from_url
         # (она же используется эндпоинтом /documents/{filename}/images/...).
-        stem = _safe_title_to_filename(title)
+        # Важно: имя должно совпадать со stem'ом итогового файла,
+        # включая префикс kb_<pid>_ если pid доступен.
+        pid_for_dir = _extract_pid_from_url(url)
+        if pid_for_dir is not None:
+            stem = Path(_kb_filename_for_pid(pid_for_dir, title)).stem
+        else:
+            stem = _safe_title_to_filename(title)
         images_dir = FILES_DIR / f"{stem}_images"
         img_counter = 0
 
