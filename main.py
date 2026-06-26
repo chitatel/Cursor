@@ -2924,6 +2924,26 @@ async def ask(req: AskRequest, request: Request):
             all_docs = docs
             all_metas = metas
 
+        # Дедуплицируем чанки по нормализованному тексту: один и тот же
+        # фрагмент мог попасть и через vector, и через BM25, и через
+        # соседние чанки document-aware. Иначе LLM выдаёт одну и ту же
+        # фразу N раз в нумерованном списке.
+        _seen_norm: set[str] = set()
+        _dedup_docs: list[str] = []
+        _dedup_metas: list[dict] = []
+        for _d, _m in zip(all_docs, all_metas):
+            _norm = re.sub(r"\s+", " ", _d).strip().lower()
+            if not _norm or _norm in _seen_norm:
+                continue
+            _seen_norm.add(_norm)
+            _dedup_docs.append(_d)
+            _dedup_metas.append(_m)
+        if len(_dedup_docs) < len(all_docs):
+            log.info(
+                "Deduplicated chunks: %d → %d", len(all_docs), len(_dedup_docs)
+            )
+        all_docs, all_metas = _dedup_docs, _dedup_metas
+
         context = "\n\n".join(
             f"[CHUNK {i} | {m['filename']}]\n{d}"
             for i, (d, m) in enumerate(zip(all_docs, all_metas))
@@ -3013,11 +3033,43 @@ async def ask(req: AskRequest, request: Request):
         answer = re.sub(r"<think>.*?</think>", "", answer, flags=re.DOTALL).strip()
         # Убираем маркеры чанков [CHUNK N] / (CHUNK N), которые LLM может скопировать из контекста
         answer = re.sub(r"\s*[\(\[]\s*CHUNK\s*\d+\s*[\)\]]", "", answer).strip()
-        # Нормализуем TeX-стрелки, которые иногда подсовывает LLM: $\rightarrow$, \rightarrow, ->
-        answer = re.sub(r"\$\s*\\?(rightarrow|to)\s*\$", "→", answer)
-        answer = re.sub(r"\\(rightarrow|to)\b", "→", answer)
+        # Нормализуем TeX-команды, которые иногда подсовывает LLM в ответ.
+        # Сначала меняем сами команды на юникод-символы, потом снимаем $...$/\(...\)/\[...\] обёртки.
+        tex_replacements = [
+            (r"\\rightarrow\b", "→"),
+            (r"\\leftarrow\b", "←"),
+            (r"\\Rightarrow\b", "⇒"),
+            (r"\\Leftarrow\b", "⇐"),
+            (r"\\leftrightarrow\b", "↔"),
+            (r"\\to\b", "→"),
+            (r"\\leq\b", "≤"),
+            (r"\\le\b", "≤"),
+            (r"\\geq\b", "≥"),
+            (r"\\ge\b", "≥"),
+            (r"\\neq\b", "≠"),
+            (r"\\ne\b", "≠"),
+            (r"\\approx\b", "≈"),
+            (r"\\equiv\b", "≡"),
+            (r"\\pm\b", "±"),
+            (r"\\times\b", "×"),
+            (r"\\cdot\b", "·"),
+            (r"\\div\b", "÷"),
+            (r"\\infty\b", "∞"),
+            (r"\\sum\b", "Σ"),
+            (r"\\alpha\b", "α"),
+            (r"\\beta\b", "β"),
+            (r"\\gamma\b", "γ"),
+            (r"\\delta\b", "δ"),
+            (r"\\mu\b", "μ"),
+            (r"\\pi\b", "π"),
+            (r"\\sigma\b", "σ"),
+            (r"\\degree\b", "°"),
+        ]
+        for pattern, repl in tex_replacements:
+            answer = re.sub(pattern, repl, answer)
+        # Стрелка из дефисов: -> / --> (вне слов вроде e->f)
         answer = re.sub(r"(?<!\w)-+>(?!\w)", "→", answer)
-        # Срезаем оставшиеся inline-формулы вида $...$ / \(...\) / \[...\] — оставляем содержимое
+        # Снимаем inline-формулы $...$ / \(...\) / \[...\] — оставляем содержимое
         answer = re.sub(r"\$([^\$\n]{1,80})\$", r"\1", answer)
         answer = re.sub(r"\\\(([^\)\n]{1,80})\\\)", r"\1", answer)
         answer = re.sub(r"\\\[([^\]\n]{1,80})\\\]", r"\1", answer)
@@ -3026,6 +3078,27 @@ async def ask(req: AskRequest, request: Request):
         for quote in ['"', "'", "«", "»"]:
             answer_clean = answer_clean.strip(quote)
         answer = answer_clean.strip().replace("\\n", "\n")
+
+        # Схлопываем дубли пунктов нумерованного списка и перенумеровываем
+        # по порядку (LLM иногда выдаёт ту же фразу под номерами 7..27,
+        # если она встречается в контексте в нескольких чанках).
+        _list_lines = answer.split("\n")
+        _item_re = re.compile(r"^\s*\d+[\.\)]\s+(.*\S)\s*$")
+        _seen_items: set[str] = set()
+        _new_lines: list[str] = []
+        _idx = 0
+        for _line in _list_lines:
+            _m = _item_re.match(_line)
+            if _m:
+                _key = re.sub(r"\s+", " ", _m.group(1)).lower()
+                if _key in _seen_items:
+                    continue
+                _seen_items.add(_key)
+                _idx += 1
+                _new_lines.append(f"{_idx}. {_m.group(1)}")
+            else:
+                _new_lines.append(_line)
+        answer = "\n".join(_new_lines)
 
         if answer != "Информация в документах не найдена.":
             if not _is_faithful(answer, context):
