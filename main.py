@@ -1814,28 +1814,44 @@ def _extract_pdf_with_images(path: Path) -> list:
 
             # OCR-fallback: если на странице нет осмысленного текстового
             # слоя (отсканированный PDF) — рендерим страницу и распознаём
-            # через RapidOCR.  Текст добавляется к page_text, чтобы он же
-            # учитывался в логике презентация/документ ниже.
-            if (
-                OCR_ENABLED
-                and len(page_text) < OCR_MIN_PAGE_CHARS
-                and _get_ocr_engine() is not None
-            ):
-                try:
-                    ocr_zoom = fitz.Matrix(OCR_ZOOM, OCR_ZOOM)
-                    ocr_pix = page.get_pixmap(matrix=ocr_zoom, alpha=False)
-                    ocr_text = _ocr_pixmap(ocr_pix)
-                    ocr_pix = None
-                except Exception as e:
-                    log.warning("[%s] page %d OCR pixmap failed: %s",
-                                path.name, page_num + 1, e)
-                    ocr_text = ""
-                if ocr_text:
-                    page_text = (page_text + "\n" + ocr_text).strip() if page_text else ocr_text
-                    log.info(
-                        "[%s] page %d: OCR recovered %d chars",
-                        path.name, page_num + 1, len(ocr_text),
+            # через EasyOCR/RapidOCR.  Текст добавляется к page_text, чтобы
+            # он же учитывался в логике презентация/документ ниже.
+            needs_ocr = OCR_ENABLED and len(page_text) < OCR_MIN_PAGE_CHARS
+            if needs_ocr:
+                log.info(
+                    "[%s] page %d: text_len=%d < %d → trying OCR",
+                    path.name, page_num + 1, len(page_text), OCR_MIN_PAGE_CHARS,
+                )
+                engine = _get_ocr_engine()
+                if engine is None:
+                    log.warning(
+                        "[%s] page %d: OCR requested but engine unavailable",
+                        path.name, page_num + 1,
                     )
+                else:
+                    try:
+                        ocr_zoom = fitz.Matrix(OCR_ZOOM, OCR_ZOOM)
+                        ocr_pix = page.get_pixmap(matrix=ocr_zoom, alpha=False)
+                        ocr_text = _ocr_pixmap(ocr_pix)
+                        ocr_pix = None
+                    except Exception as e:
+                        log.warning("[%s] page %d OCR pixmap failed: %s",
+                                    path.name, page_num + 1, e)
+                        ocr_text = ""
+                    if ocr_text:
+                        page_text = (
+                            (page_text + "\n" + ocr_text).strip()
+                            if page_text else ocr_text
+                        )
+                        log.info(
+                            "[%s] page %d: OCR recovered %d chars",
+                            path.name, page_num + 1, len(ocr_text),
+                        )
+                    else:
+                        log.warning(
+                            "[%s] page %d: OCR returned empty result",
+                            path.name, page_num + 1,
+                        )
 
             if page_text:
                 parts.append(page_text)
@@ -2390,6 +2406,10 @@ async def lifespan(app: FastAPI):
             _faiss_index = None
             log.info("Index is empty, skipping FAISS build.")
     log.info("FAISS index ready: %d chunks", len(records))
+    log.info(
+        "OCR config: enabled=%s, min_page_chars=%d, zoom=%.1f",
+        OCR_ENABLED, OCR_MIN_PAGE_CHARS, OCR_ZOOM,
+    )
     yield
 
 
