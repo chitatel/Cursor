@@ -1846,6 +1846,7 @@ def _extract_pdf_with_images(path: Path) -> list:
 
             for marker in page_markers:
                 parts.append(marker)
+        page_count = len(doc)
     finally:
         doc.close()
 
@@ -1865,7 +1866,6 @@ def _extract_pdf_with_images(path: Path) -> list:
                 shutil.rmtree(images_dir, ignore_errors=True)
             except Exception:
                 pass
-        page_count = len(doc) if doc else 0
         raise ValueError(
             f"PDF выглядит как отсканированный — текстового слоя нет "
             f"(извлечено {len(text_without_markers)} симв. из {page_count} стр., "
