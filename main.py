@@ -102,13 +102,10 @@ KB_PORTAL_PASSWORD = str(CONFIG.get("KB_PORTAL_PASSWORD", ""))
 # подписанный внутренним корпоративным CA сертификат — поставить false.
 KB_PORTAL_VERIFY_SSL = bool(CONFIG.get("KB_PORTAL_VERIFY_SSL", True))
 
-# OCR для отсканированных PDF.  Если страница даёт меньше OCR_MIN_PAGE_CHARS
-# символов через обычное извлечение текста — пробуем распознать её через
-# RapidOCR (чистый pip, ONNX-инференс, без PyTorch).  Если пакета нет —
-# OCR молча отключается и сервис работает как раньше.
-OCR_ENABLED = bool(CONFIG.get("OCR_ENABLED", True))
-OCR_MIN_PAGE_CHARS = int(CONFIG.get("OCR_MIN_PAGE_CHARS", 50))
-OCR_ZOOM = float(CONFIG.get("OCR_ZOOM", 2.0))
+# Отсканированные PDF (без текстового слоя) отвергаются на загрузке.
+# Если общее число символов, извлечённых из PDF, меньше этого порога —
+# считаем его сканом и возвращаем 400 с понятной ошибкой.
+PDF_MIN_TEXT_CHARS = int(CONFIG.get("PDF_MIN_TEXT_CHARS", 200))
 
 # Размер батча для эмбеддингов при индексировании
 EMBED_BATCH_SIZE = int(CONFIG.get("EMBED_BATCH_SIZE", 32))
@@ -1670,95 +1667,6 @@ def _extract_docx_with_images(path: Path) -> list:
     return [Document(text=full_text, metadata={"filename": path.name})]
 
 
-# ── OCR для отсканированных PDF ───────────────────────────────────────────────
-
-_ocr_engine = None
-_ocr_backend: str = ""  # "easyocr" | "rapidocr"
-_ocr_unavailable = False  # уже пробовали инициализировать и не получилось
-
-
-def _get_ocr_engine():
-    """
-    Лениво создаёт OCR-движок.  Предпочтительно EasyOCR (поддерживает русский
-    из коробки), при его отсутствии — RapidOCR.  Первый вызов EasyOCR скачает
-    модели (~64 МБ для ru+en) в ~/.EasyOCR.  Если ни одного OCR-пакета нет —
-    возвращаем None и сервис работает как раньше (PDF-сканы не распознаются).
-    """
-    global _ocr_engine, _ocr_backend, _ocr_unavailable
-    if _ocr_engine is not None:
-        return _ocr_engine
-    if _ocr_unavailable or not OCR_ENABLED:
-        return None
-    # 1) EasyOCR — основной выбор: русский поддерживается стандартной моделью
-    try:
-        import easyocr
-        _ocr_engine = easyocr.Reader(["ru", "en"], gpu=False, verbose=False)
-        _ocr_backend = "easyocr"
-        log.info("[OCR] EasyOCR engine initialised (ru+en, CPU)")
-        return _ocr_engine
-    except ImportError:
-        pass
-    except Exception as e:
-        log.warning("[OCR] failed to init EasyOCR: %s", e)
-    # 2) RapidOCR — fallback (по умолчанию китайская модель; для русского
-    # потребуется отдельная PaddleOCR-модель cyrillic, поэтому не рекомендуется)
-    try:
-        from rapidocr_onnxruntime import RapidOCR
-        _ocr_engine = RapidOCR()
-        _ocr_backend = "rapidocr"
-        log.info("[OCR] RapidOCR engine initialised (default model — accuracy on Cyrillic limited)")
-        return _ocr_engine
-    except ImportError:
-        log.warning(
-            "[OCR] no OCR package installed — scanned PDFs will not be recognised. "
-            "Install one: pip install easyocr   (recommended for Russian)"
-        )
-    except Exception as e:
-        log.warning("[OCR] failed to init RapidOCR: %s", e)
-    _ocr_unavailable = True
-    return None
-
-
-def _ocr_pixmap(pix) -> str:
-    """
-    Прогоняет PyMuPDF pixmap через OCR-движок и возвращает распознанный текст
-    с переносами строк, сохраняющими порядок чтения (top→bottom, left→right).
-    """
-    engine = _get_ocr_engine()
-    if engine is None:
-        return ""
-    try:
-        import numpy as np
-        img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
-            pix.height, pix.width, pix.n
-        )
-        if pix.n == 4:
-            img = img[:, :, :3]  # отбрасываем альфу
-        if _ocr_backend == "easyocr":
-            # EasyOCR: detail=1 → [(box, text, score), ...]
-            raw = engine.readtext(img, detail=1, paragraph=False)
-            triples = [(item[0], item[1], item[2]) for item in raw or []]
-        else:
-            # RapidOCR: (result, elapsed); result — [[box, text, score], ...]
-            result, _elapsed = engine(img)
-            triples = [(it[0], it[1], it[2]) for it in result or []]
-    except Exception as e:
-        log.warning("[OCR] recognition failed: %s", e)
-        return ""
-    if not triples:
-        return ""
-    lines: list[tuple[float, float, str]] = []
-    for box, text, _score in triples:
-        try:
-            ys = [pt[1] for pt in box]
-            xs = [pt[0] for pt in box]
-            lines.append((min(ys), min(xs), str(text).strip()))
-        except Exception:
-            continue
-    lines.sort(key=lambda t: (round(t[0] / 15.0), t[1]))
-    return "\n".join(t[2] for t in lines if t[2])
-
-
 def _extract_pdf_with_images(path: Path) -> list:
     """
     Извлекает текст из .pdf с сохранением изображений через PyMuPDF (fitz).
@@ -1811,48 +1719,6 @@ def _extract_pdf_with_images(path: Path) -> list:
 
             # Текст страницы
             page_text = page.get_text().strip()
-
-            # OCR-fallback: если на странице нет осмысленного текстового
-            # слоя (отсканированный PDF) — рендерим страницу и распознаём
-            # через EasyOCR/RapidOCR.  Текст добавляется к page_text, чтобы
-            # он же учитывался в логике презентация/документ ниже.
-            needs_ocr = OCR_ENABLED and len(page_text) < OCR_MIN_PAGE_CHARS
-            if needs_ocr:
-                log.info(
-                    "[%s] page %d: text_len=%d < %d → trying OCR",
-                    path.name, page_num + 1, len(page_text), OCR_MIN_PAGE_CHARS,
-                )
-                engine = _get_ocr_engine()
-                if engine is None:
-                    log.warning(
-                        "[%s] page %d: OCR requested but engine unavailable",
-                        path.name, page_num + 1,
-                    )
-                else:
-                    try:
-                        ocr_zoom = fitz.Matrix(OCR_ZOOM, OCR_ZOOM)
-                        ocr_pix = page.get_pixmap(matrix=ocr_zoom, alpha=False)
-                        ocr_text = _ocr_pixmap(ocr_pix)
-                        ocr_pix = None
-                    except Exception as e:
-                        log.warning("[%s] page %d OCR pixmap failed: %s",
-                                    path.name, page_num + 1, e)
-                        ocr_text = ""
-                    if ocr_text:
-                        page_text = (
-                            (page_text + "\n" + ocr_text).strip()
-                            if page_text else ocr_text
-                        )
-                        log.info(
-                            "[%s] page %d: OCR recovered %d chars",
-                            path.name, page_num + 1, len(ocr_text),
-                        )
-                    else:
-                        log.warning(
-                            "[%s] page %d: OCR returned empty result",
-                            path.name, page_num + 1,
-                        )
-
             if page_text:
                 parts.append(page_text)
 
@@ -1984,8 +1850,30 @@ def _extract_pdf_with_images(path: Path) -> list:
         doc.close()
 
     full_text = "\n".join(parts).strip()
-    if not full_text:
-        raise ValueError("No text extracted from PDF file")
+
+    # Считаем «полезный» текст — без маркеров [Рисунок N: img_NNN.ext].
+    # Если его меньше PDF_MIN_TEXT_CHARS — это отсканированный PDF без
+    # текстового слоя.  Распознавание сканов не поддерживается, отдаём
+    # понятную ошибку.
+    text_without_markers = re.sub(
+        r"\[Рисунок\s+\d+:\s*[^\]]+\]", "", full_text
+    ).strip()
+    if len(text_without_markers) < PDF_MIN_TEXT_CHARS:
+        # подчищаем уже сохранённые картинки — файл всё равно отвергнут
+        if images_dir.is_dir():
+            try:
+                shutil.rmtree(images_dir, ignore_errors=True)
+            except Exception:
+                pass
+        page_count = len(doc) if doc else 0
+        raise ValueError(
+            f"PDF выглядит как отсканированный — текстового слоя нет "
+            f"(извлечено {len(text_without_markers)} симв. из {page_count} стр., "
+            f"порог {PDF_MIN_TEXT_CHARS}). "
+            "Распознавание сканов не поддерживается. "
+            "Сохраните файл с текстовым слоем (например, через «Печать в PDF» "
+            "из Word) и попробуйте снова."
+        )
 
     if img_counter == 0:
         try:
@@ -1993,7 +1881,10 @@ def _extract_pdf_with_images(path: Path) -> list:
         except OSError:
             pass
 
-    log.info("[%s] Extracted %d images from PDF", path.name, img_counter)
+    log.info(
+        "[%s] Extracted %d images from PDF (text chars: %d)",
+        path.name, img_counter, len(text_without_markers),
+    )
     return [Document(text=full_text, metadata={"filename": path.name})]
 
 
@@ -2406,10 +2297,7 @@ async def lifespan(app: FastAPI):
             _faiss_index = None
             log.info("Index is empty, skipping FAISS build.")
     log.info("FAISS index ready: %d chunks", len(records))
-    log.info(
-        "OCR config: enabled=%s, min_page_chars=%d, zoom=%.1f",
-        OCR_ENABLED, OCR_MIN_PAGE_CHARS, OCR_ZOOM,
-    )
+    log.info("PDF policy: reject scans with text < %d chars", PDF_MIN_TEXT_CHARS)
     yield
 
 
