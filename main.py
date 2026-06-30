@@ -1585,12 +1585,170 @@ def _attach_images_to_answer(
 
 # ── Извлечение изображений из документов ─────────────────────────────────────
 
+def _docx_has_ole_objects(path: Path) -> bool:
+    """
+    Проверяет, есть ли в .docx встроенные OLE-объекты (Visio-схемы и т.п.).
+    OLE хранится как word/embeddings/oleObjectN.bin внутри docx-архива.
+    Если есть — обычные средства python-docx не могут вытащить иллюстрацию.
+    """
+    import zipfile
+    try:
+        with zipfile.ZipFile(str(path), "r") as z:
+            for name in z.namelist():
+                if name.startswith("word/embeddings/"):
+                    return True
+    except Exception:
+        return False
+    return False
+
+
+def _convert_docx_to_pdf_via_word(docx_path: Path, pdf_path: Path) -> bool:
+    """
+    Конвертирует docx в PDF через установленный Microsoft Word (COM-автоматизация).
+    Возвращает True при успехе.  Требует pywin32 и Windows-сервер с Word.
+
+    Работает синхронно — вызывать через executor.  Word процесс закрывается
+    в finally, даже при ошибке.
+    """
+    try:
+        import pythoncom  # type: ignore
+        import win32com.client  # type: ignore
+    except ImportError:
+        log.warning(
+            "[docx→pdf] pywin32 not installed — OLE objects in docx will be skipped. "
+            "Install: pip install pywin32"
+        )
+        return False
+
+    word = None
+    document = None
+    try:
+        pythoncom.CoInitialize()
+        word = win32com.client.DispatchEx("Word.Application")
+        word.Visible = False
+        word.DisplayAlerts = 0  # wdAlertsNone
+        document = word.Documents.Open(
+            str(docx_path.resolve()),
+            ReadOnly=True,
+            AddToRecentFiles=False,
+            Visible=False,
+        )
+        # 17 = wdFormatPDF
+        document.SaveAs(str(pdf_path.resolve()), FileFormat=17)
+        log.info("[docx→pdf] converted %s → %s via Word COM",
+                 docx_path.name, pdf_path.name)
+        return True
+    except Exception as e:
+        log.warning("[docx→pdf] Word COM conversion failed for %s: %s",
+                    docx_path.name, e)
+        return False
+    finally:
+        try:
+            if document is not None:
+                document.Close(SaveChanges=0)
+        except Exception:
+            pass
+        try:
+            if word is not None:
+                word.Quit()
+        except Exception:
+            pass
+        try:
+            pythoncom.CoUninitialize()
+        except Exception:
+            pass
+
+
+def _extract_docx_via_pdf_render(path: Path) -> Optional[list]:
+    """
+    Стратегия для docx с OLE-объектами (Visio-схемы):
+    1. Конвертирует docx в PDF через Word COM (Word уже учитывает страницы и
+       рендерит OLE как векторную графику).
+    2. Прогоняет полученный PDF через _extract_pdf_with_images — она уже
+       умеет находить страницы с большой графикой и сохранять их как
+       картинки (presentation mode).
+    3. Возвращает результат с metadata.filename = имя исходного docx
+       (чтобы download-ссылки и индексация работали с оригиналом).
+
+    Возвращает None при неудаче — тогда вызывающий код использует
+    обычный путь _extract_docx_with_images.
+    """
+    import tempfile
+    from llama_index.core.schema import Document
+
+    tmp_pdf = Path(tempfile.gettempdir()) / f"_docx2pdf_{path.stem}_{int(time.time())}.pdf"
+    try:
+        ok = _convert_docx_to_pdf_via_word(path, tmp_pdf)
+        if not ok or not tmp_pdf.exists():
+            return None
+
+        # _extract_pdf_with_images создаст FILES_DIR/<stem>_images.
+        # Чтобы папка картинок соответствовала имени docx, временно
+        # переименуем PDF (точнее — передадим путь с именем docx).
+        # Самый простой способ: подменим path.stem через симлинк/копию.
+        # Здесь идём через копию имени: создаём вторую копию рядом.
+        target_pdf = Path(tempfile.gettempdir()) / f"{path.stem}.pdf"
+        try:
+            if target_pdf.exists():
+                target_pdf.unlink()
+            tmp_pdf.replace(target_pdf)
+        except Exception as e:
+            log.warning("[docx→pdf] could not rename to %s: %s", target_pdf, e)
+            target_pdf = tmp_pdf
+
+        # ВАЖНО: _extract_pdf_with_images кладёт картинки в
+        # FILES_DIR / f"{path.stem}_images".  Мы хотим, чтобы эта папка
+        # совпала с именем исходного docx → даём ей путь с нужным stem.
+        try:
+            # docx→pdf от Word всегда даёт текстовый слой, но если в docx
+            # один Visio на странице, текстового слоя в этой странице может
+            # не быть — это нормально, не отвергаем такой PDF.
+            pdf_docs = _extract_pdf_with_images(target_pdf, require_text_layer=False)
+        finally:
+            try:
+                target_pdf.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+        # Подменяем metadata.filename на имя исходного docx
+        result = []
+        for d in pdf_docs:
+            new_meta = dict(getattr(d, "metadata", {}) or {})
+            new_meta["filename"] = path.name
+            result.append(Document(text=getattr(d, "text", ""), metadata=new_meta))
+        log.info(
+            "[%s] extracted via Word→PDF render: %d docs", path.name, len(result),
+        )
+        return result
+    except Exception as e:
+        log.warning("[%s] Word→PDF pipeline failed: %s", path.name, e)
+        return None
+    finally:
+        try:
+            tmp_pdf.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
 def _extract_docx_with_images(path: Path) -> list:
     """
     Извлекает текст из .docx с сохранением изображений.
     Изображения сохраняются в FILES_DIR/<stem>_images/img_001.png и т.д.
     В текст вставляются маркеры [Рисунок N: img_NNN.ext] на месте картинок.
+
+    Если в docx есть OLE-объекты (например, Visio блок-схемы) — сначала
+    пытаемся отрендерить через Word COM → PDF, потому что python-docx
+    OLE-содержимое не видит.  При неудаче — обычный путь.
     """
+    if _docx_has_ole_objects(path):
+        log.info("[%s] docx contains OLE objects — trying Word→PDF render",
+                 path.name)
+        result = _extract_docx_via_pdf_render(path)
+        if result is not None:
+            return result
+        log.info("[%s] falling back to python-docx (OLE objects will be lost)",
+                 path.name)
+
     from docx import Document as DocxDocument
     from docx.opc.constants import RELATIONSHIP_TYPE as RT
     from llama_index.core.schema import Document
@@ -1667,7 +1825,7 @@ def _extract_docx_with_images(path: Path) -> list:
     return [Document(text=full_text, metadata={"filename": path.name})]
 
 
-def _extract_pdf_with_images(path: Path) -> list:
+def _extract_pdf_with_images(path: Path, *, require_text_layer: bool = True) -> list:
     """
     Извлекает текст из .pdf с сохранением изображений через PyMuPDF (fitz).
     Изображения сохраняются в FILES_DIR/<stem>_images/img_001.ext и т.д.
@@ -1859,7 +2017,7 @@ def _extract_pdf_with_images(path: Path) -> list:
     text_without_markers = re.sub(
         r"\[Рисунок\s+\d+:\s*[^\]]+\]", "", full_text
     ).strip()
-    if len(text_without_markers) < PDF_MIN_TEXT_CHARS:
+    if require_text_layer and len(text_without_markers) < PDF_MIN_TEXT_CHARS:
         # подчищаем уже сохранённые картинки — файл всё равно отвергнут
         if images_dir.is_dir():
             try:
