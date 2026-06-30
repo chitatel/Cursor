@@ -2106,11 +2106,16 @@ def _extract_pdf_with_images(path: Path, *, require_text_layer: bool = True) -> 
                 if op_count >= 20 and max_x > min_x and max_y > min_y:
                     gfx_area = (max_x - min_x) * (max_y - min_y)
                     gfx_ratio = gfx_area / page_area
-                    # ТАБЛИЦА: горизонтальные длинные линии образуют
-                    # регулярную сетку (≥4 строк через всю ширину).
-                    # БЛОК-СХЕМА: преобладают короткие соединители
-                    # (стрелки между блоками), длинных линий мало.
-                    is_table_grid = len(horiz_long_y) >= 4
+                    # БЛОК-СХЕМА Visio имеет МНОГО блоков (50+)
+                    # и стрелок-соединителей. ТАБЛИЦА = относительно
+                    # мало ячеек-блоков (10-40) + длинные разделители
+                    # сетки. Стр.2 (Реестр): blocks=42, horiz_long=14.
+                    # Стр.20 (Форма Сбербанк): blocks=30, horiz_long=2.
+                    # Стр.13-16 (Visio): blocks=94-114, horiz_long=2-11.
+                    has_many_blocks = n_blocks >= 50
+                    # Сильно регулярная сетка ≥15 горизонталей = точно
+                    # таблица (стр.2 имеет 14, граничный случай).
+                    is_strong_grid = len(horiz_long_y) >= 15
                     # Доля коротких соединителей среди тонких линий —
                     # признак блок-схемы.
                     total_thin = n_thin_long + n_thin_short
@@ -2123,7 +2128,8 @@ def _extract_pdf_with_images(path: Path, *, require_text_layer: bool = True) -> 
                         and len(page_text) < 800
                         and op_count >= 40
                         and has_connectors
-                        and not is_table_grid
+                        and has_many_blocks
+                        and not is_strong_grid
                     ):
                         has_vector_graphic = True
                         log.info(
