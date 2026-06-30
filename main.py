@@ -1502,6 +1502,10 @@ def _attach_images_to_answer(
     Для каждой группы берём текст перед первой картинкой группы.
     Для каждого пункта ответа ищем группу с наибольшим пересечением слов.
     Привязываем всю группу (все картинки) к пункту.
+
+    Дополнительно, для случаев когда пункт ответа явно ссылается на имя
+    файла-источника (например, «...представлена в Приложении А СТО.CNt-008.1.25...»),
+    делаем второй проход и привязываем оставшиеся картинки по имени файла.
     """
     img_marker_re = re.compile(r"\[Рисунок \d+: [^\]]+\]")
 
@@ -1509,14 +1513,27 @@ def _attach_images_to_answer(
         cleaned = img_marker_re.sub("", text)
         return set(re.findall(r"[А-Яа-яЁёA-Za-z0-9-]{4,}", cleaned.lower()))
 
+    def filename_tokens(filename: str) -> set[str]:
+        """Осмысленные слова из имени файла: CTO.CNt-008.1.25, термолэнд, и т.п."""
+        stem = filename.rsplit(".", 1)[0]
+        tokens = set(re.findall(r"[А-Яа-яЁёA-Za-z0-9\.\-]{3,}", stem.lower()))
+        return tokens
+
     # Группируем маркеры: если между двумя маркерами нет значимого текста
     # (менее 3 слов), они образуют одну группу
-    # group = (preceding_bag, [url1, url2, ...])
-    groups: list[tuple[set[str], list[str]]] = []
+    # group = (preceding_bag, [url1, url2, ...], source_filename)
+    groups: list[tuple[set[str], list[str], str]] = []
+    # Сопоставление chunk_text → meta (для извлечения filename группы)
+    text_to_filename: dict[int, str] = {}
+    for idx, (chunk_text, meta) in enumerate(zip(chunks, chunk_metas)):
+        text_to_filename[id(chunk_text)] = meta.get("filename", "")
+
     for chunk_text in chunks:
         markers_in_chunk = list(img_marker_re.finditer(chunk_text))
         if not markers_in_chunk:
             continue
+
+        chunk_filename = text_to_filename.get(id(chunk_text), "")
 
         current_group_urls: list[str] = []
         current_group_preceding: set[str] = set()
@@ -1533,7 +1550,7 @@ def _attach_images_to_answer(
             if i == 0 or len(preceding_words) >= 1:
                 # Начало новой группы: первый маркер или есть хоть одно слово перед ним
                 if current_group_urls:
-                    groups.append((current_group_preceding, current_group_urls))
+                    groups.append((current_group_preceding, current_group_urls, chunk_filename))
                 current_group_preceding = preceding_words
                 current_group_urls = [url]
             else:
@@ -1541,7 +1558,12 @@ def _attach_images_to_answer(
                 current_group_urls.append(url)
 
         if current_group_urls:
-            groups.append((current_group_preceding, current_group_urls))
+            groups.append((current_group_preceding, current_group_urls, chunk_filename))
+
+    log.info(
+        "[attach_images] %d groups built from %d chunks (image_urls: %d)",
+        len(groups), len(chunks), len(image_urls),
+    )
 
     if not groups:
         return answer
@@ -1554,18 +1576,22 @@ def _attach_images_to_answer(
     if not points:
         return answer
 
+    log.info("[attach_images] %d points parsed from answer", len(points))
+
     used_groups: set[int] = set()
     result_parts: list[str] = []
+    point_assignments: list[int] = []  # для каждого пункта — индекс группы (-1 если не нашли)
 
-    for point in points:
+    # Первый проход: bag-of-words по тексту вокруг картинки (исходная логика)
+    for pi, point in enumerate(points):
         point_bag = bag(point)
         if not point_bag:
-            result_parts.append(point)
+            point_assignments.append(-1)
             continue
 
         best_idx = -1
         best_score = 0
-        for idx, (preceding_bag, urls) in enumerate(groups):
+        for idx, (preceding_bag, urls, _fn) in enumerate(groups):
             if idx in used_groups:
                 continue
             score = len(point_bag & preceding_bag)
@@ -1575,7 +1601,52 @@ def _attach_images_to_answer(
 
         if best_idx >= 0 and best_score >= 2:
             used_groups.add(best_idx)
-            all_urls = "\n".join(groups[best_idx][1])
+            point_assignments.append(best_idx)
+            log.info(
+                "[attach_images] point %d → group %d (bag-of-words score=%d)",
+                pi + 1, best_idx, best_score,
+            )
+        else:
+            point_assignments.append(-1)
+            log.info(
+                "[attach_images] point %d: no bag-of-words match (best_score=%d)",
+                pi + 1, best_score,
+            )
+
+    # Второй проход: если пункт не получил картинку, но упоминает имя файла
+    # группы в своём тексте — привязываем.  Минимум 1 совпадающий токен имени
+    # файла (достаточно специфично: «CTO.CNt-008.1.25»).
+    for i, point in enumerate(points):
+        if point_assignments[i] >= 0:
+            continue
+        point_lower = point.lower()
+        best_idx = -1
+        best_score = 0
+        for idx, (_preceding_bag, _urls, fn) in enumerate(groups):
+            if idx in used_groups or not fn:
+                continue
+            tokens = filename_tokens(fn)
+            score = sum(1 for t in tokens if t in point_lower and len(t) >= 5)
+            if score > best_score:
+                best_score = score
+                best_idx = idx
+        if best_idx >= 0 and best_score >= 1:
+            used_groups.add(best_idx)
+            point_assignments[i] = best_idx
+            log.info(
+                "[attach_images] point %d → group %d (filename match score=%d, fn=%s)",
+                i + 1, best_idx, best_score, groups[best_idx][2],
+            )
+        else:
+            log.info(
+                "[attach_images] point %d: no filename match (best_score=%d)",
+                i + 1, best_score,
+            )
+
+    # Финальная сборка
+    for point, group_idx in zip(points, point_assignments):
+        if group_idx >= 0:
+            all_urls = "\n".join(groups[group_idx][1])
             result_parts.append(f"{point}\n{all_urls}")
         else:
             result_parts.append(point)
