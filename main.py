@@ -2056,7 +2056,16 @@ def _extract_pdf_with_images(path: Path, *, require_text_layer: bool = True) -> 
                 rects: list[tuple[float, float, float, float]] = []
                 min_x, min_y = float("inf"), float("inf")
                 max_x, max_y = 0.0, 0.0
-                n_thin_lines = 0  # тонкие длинные линии — соединители блок-схемы
+                # Тонкие линии:
+                #   long  — длинные (через всю таблицу/блок) = сетка таблицы
+                #   short — короткие (между блоками) = соединители схемы
+                n_thin_long = 0
+                n_thin_short = 0
+                # Прямоугольные блоки (не тонкие) — фигуры схемы / ячейки
+                n_blocks = 0
+                # Y-координаты горизонтальных длинных линий — для оценки
+                # регулярности сетки таблицы.
+                horiz_long_y: list[float] = []
                 for dr in drawings:
                     r = dr.get("rect")
                     if not r:
@@ -2072,10 +2081,22 @@ def _extract_pdf_with_images(path: Path, *, require_text_layer: bool = True) -> 
                     h = ry1 - ry0
                     if w < 8 and h < 8:
                         continue
-                    # Тонкая линия-соединитель: одна сторона ≤3pt,
-                    # другая ≥30pt. Это стрелки и линии связи в схеме.
-                    if (w <= 3 and h >= 30) or (h <= 3 and w >= 30):
-                        n_thin_lines += 1
+                    is_thin_h = h <= 3 and w >= 30   # горизонтальная линия
+                    is_thin_v = w <= 3 and h >= 30   # вертикальная линия
+                    if is_thin_h or is_thin_v:
+                        # Длинная (≥200pt) = разделитель таблицы через всю
+                        # ширину/высоту. Короткая (30-200pt) = соединитель.
+                        long_side = max(w, h)
+                        if long_side >= 200:
+                            n_thin_long += 1
+                            if is_thin_h:
+                                horiz_long_y.append(ry0)
+                        else:
+                            n_thin_short += 1
+                    else:
+                        # Прямоугольник нормальной пропорции — блок фигуры
+                        # или ячейка таблицы.
+                        n_blocks += 1
                     rects.append((rx0, ry0, rx1, ry1))
                     min_x = min(min_x, rx0)
                     min_y = min(min_y, ry0)
@@ -2085,36 +2106,45 @@ def _extract_pdf_with_images(path: Path, *, require_text_layer: bool = True) -> 
                 if op_count >= 20 and max_x > min_x and max_y > min_y:
                     gfx_area = (max_x - min_x) * (max_y - min_y)
                     gfx_ratio = gfx_area / page_area
-                    # У БЛОК-СХЕМЫ есть стрелки/линии-коннекторы между
-                    # блоками — тонкие длинные линии. У ТАБЛИЦЫ их нет
-                    # (только прямоугольники-ячейки с балансированной
-                    # геометрией).
-                    # Дополнительная защита: пустые страницы со штампом
-                    # имеют мало операций — отсекаем порогом op_count.
-                    has_connectors = n_thin_lines >= 3
+                    # ТАБЛИЦА: горизонтальные длинные линии образуют
+                    # регулярную сетку (≥4 строк через всю ширину).
+                    # БЛОК-СХЕМА: преобладают короткие соединители
+                    # (стрелки между блоками), длинных линий мало.
+                    is_table_grid = len(horiz_long_y) >= 4
+                    # Доля коротких соединителей среди тонких линий —
+                    # признак блок-схемы.
+                    total_thin = n_thin_long + n_thin_short
+                    short_ratio = (
+                        n_thin_short / total_thin if total_thin > 0 else 0.0
+                    )
+                    has_connectors = n_thin_short >= 5 and short_ratio >= 0.4
                     if (
                         gfx_ratio >= 0.45
                         and len(page_text) < 800
                         and op_count >= 40
                         and has_connectors
+                        and not is_table_grid
                     ):
                         has_vector_graphic = True
                         log.info(
                             "[%s] page %d: vector graphic detected "
                             "(%d ops, %.0f%% area, text=%d, "
-                            "thin_lines=%d)",
+                            "thin_short=%d, thin_long=%d, "
+                            "horiz_long=%d, blocks=%d)",
                             path.name, page_num + 1, op_count,
                             100.0 * gfx_ratio, len(page_text),
-                            n_thin_lines,
+                            n_thin_short, n_thin_long,
+                            len(horiz_long_y), n_blocks,
                         )
                     elif gfx_ratio >= 0.45 and len(page_text) < 800:
                         log.info(
                             "[%s] page %d: skip vector (%d ops, %.0f%% area, "
-                            "text=%d, thin_lines=%d) "
-                            "— not a flowchart (no connectors or too few ops)",
+                            "text=%d, thin_short=%d, thin_long=%d, "
+                            "horiz_long=%d, blocks=%d) — not a flowchart",
                             path.name, page_num + 1, op_count,
                             100.0 * gfx_ratio, len(page_text),
-                            n_thin_lines,
+                            n_thin_short, n_thin_long,
+                            len(horiz_long_y), n_blocks,
                         )
 
             # Шаг 2: выбор стратегии — слайд или документ?
