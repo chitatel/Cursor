@@ -2056,6 +2056,7 @@ def _extract_pdf_with_images(path: Path, *, require_text_layer: bool = True) -> 
                 rects: list[tuple[float, float, float, float]] = []
                 min_x, min_y = float("inf"), float("inf")
                 max_x, max_y = 0.0, 0.0
+                n_thin_lines = 0  # тонкие длинные линии — соединители блок-схемы
                 for dr in drawings:
                     r = dr.get("rect")
                     if not r:
@@ -2071,6 +2072,10 @@ def _extract_pdf_with_images(path: Path, *, require_text_layer: bool = True) -> 
                     h = ry1 - ry0
                     if w < 8 and h < 8:
                         continue
+                    # Тонкая линия-соединитель: одна сторона ≤3pt,
+                    # другая ≥30pt. Это стрелки и линии связи в схеме.
+                    if (w <= 3 and h >= 30) or (h <= 3 and w >= 30):
+                        n_thin_lines += 1
                     rects.append((rx0, ry0, rx1, ry1))
                     min_x = min(min_x, rx0)
                     min_y = min(min_y, ry0)
@@ -2080,56 +2085,36 @@ def _extract_pdf_with_images(path: Path, *, require_text_layer: bool = True) -> 
                 if op_count >= 20 and max_x > min_x and max_y > min_y:
                     gfx_area = (max_x - min_x) * (max_y - min_y)
                     gfx_ratio = gfx_area / page_area
-                    # Чтобы отличить блок-схему от таблицы:
-                    # У ТАБЛИЦЫ ячейки регулярные — много прямоугольников
-                    # одинаковой высоты (строки), сгруппированы в кластеры
-                    # по Y-координате.  Все Y-координаты прижаты к
-                    # небольшому числу уровней (5-30 строк) на регулярном
-                    # шаге.
-                    # У БЛОК-СХЕМЫ блоки разной высоты, разнобоя по Y,
-                    # уровни не образуют регулярную решётку.
-                    widths = [r[2] - r[0] for r in rects]
-                    heights = [r[3] - r[1] for r in rects]
-                    x_lefts = [round(r[0]) for r in rects]
-                    y_tops = [round(r[1]) for r in rects]
-                    # Кластеры по координатам (точность 5pt)
-                    x_buckets = {round(x / 5.0) * 5 for x in x_lefts}
-                    y_buckets = {round(y / 5.0) * 5 for y in y_tops}
-                    n_x_clusters = len(x_buckets)
-                    n_y_clusters = len(y_buckets)
-                    unique_heights = {round(h / 5.0) * 5 for h in heights}
-                    n_unique_heights = len(unique_heights)
-                    # Если в среднем на каждый Y-уровень приходится ≥3
-                    # прямоугольника одинаковой высоты — это строки таблицы.
-                    avg_per_y = op_count / max(n_y_clusters, 1)
-                    is_table_like = (
-                        n_unique_heights <= 4   # 1-4 типа высоты строк
-                        and avg_per_y >= 3      # в среднем 3+ ячейки на строку
-                        and n_y_clusters >= 3   # минимум 3 строки таблицы
-                    )
+                    # У БЛОК-СХЕМЫ есть стрелки/линии-коннекторы между
+                    # блоками — тонкие длинные линии. У ТАБЛИЦЫ их нет
+                    # (только прямоугольники-ячейки с балансированной
+                    # геометрией).
+                    # Дополнительная защита: пустые страницы со штампом
+                    # имеют мало операций — отсекаем порогом op_count.
+                    has_connectors = n_thin_lines >= 3
                     if (
                         gfx_ratio >= 0.45
                         and len(page_text) < 800
-                        and not is_table_like
+                        and op_count >= 40
+                        and has_connectors
                     ):
                         has_vector_graphic = True
                         log.info(
                             "[%s] page %d: vector graphic detected "
-                            "(%d ops, %.0f%% area, text=%d, x_clusters=%d, "
-                            "y_clusters=%d, uniq_heights=%d, avg_per_y=%.1f)",
+                            "(%d ops, %.0f%% area, text=%d, "
+                            "thin_lines=%d)",
                             path.name, page_num + 1, op_count,
                             100.0 * gfx_ratio, len(page_text),
-                            n_x_clusters, n_y_clusters,
-                            n_unique_heights, avg_per_y,
+                            n_thin_lines,
                         )
-                    elif gfx_ratio >= 0.45 and len(page_text) < 800 and is_table_like:
+                    elif gfx_ratio >= 0.45 and len(page_text) < 800:
                         log.info(
-                            "[%s] page %d: table-like (%d ops, %.0f%% area, "
-                            "y_clusters=%d, uniq_heights=%d, avg_per_y=%.1f) "
-                            "— NOT a flowchart",
+                            "[%s] page %d: skip vector (%d ops, %.0f%% area, "
+                            "text=%d, thin_lines=%d) "
+                            "— not a flowchart (no connectors or too few ops)",
                             path.name, page_num + 1, op_count,
-                            100.0 * gfx_ratio, n_y_clusters,
-                            n_unique_heights, avg_per_y,
+                            100.0 * gfx_ratio, len(page_text),
+                            n_thin_lines,
                         )
 
             # Шаг 2: выбор стратегии — слайд или документ?
