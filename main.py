@@ -3482,8 +3482,8 @@ async def ask(req: AskRequest, request: Request):
 
         # Источник картинок — primary, если у него они есть.  Иначе —
         # первый по support_score документ, у которого есть картинки
-        # (тогда блок-схема из документа №2 показывается, даже если
-        # текст ответа взят из №1).
+        # в top_k (тогда блок-схема из документа №2 показывается, даже
+        # если текст ответа взят из №1).
         if _primary_source and _primary_source in _img_chunk_counts:
             _img_source_file = _primary_source
         else:
@@ -3491,6 +3491,28 @@ async def ask(req: AskRequest, request: Request):
                 (fn for fn in sources if fn in _img_chunk_counts),
                 None,
             )
+
+        # Глобальный fallback: ни один документ из top_k не имеет картинок
+        # в выдаче (например, картинка лежит только в конце документа,
+        # а top_k собрал чанки из начала).  Проверяем по индексу: есть ли
+        # у любого из источников вообще image-chunks?  Берём первого
+        # такого по support_score.
+        if _img_source_file is None and sources:
+            for fn in sources:
+                try:
+                    recs = await _document_records(fn)
+                except Exception:
+                    continue
+                for rec in recs:
+                    if img_marker_re.search(rec.get("text", "") or ""):
+                        _img_source_file = fn
+                        log.info(
+                            "[attach_images] fallback to source %s (no img in top_k, but found in index)",
+                            fn,
+                        )
+                        break
+                if _img_source_file:
+                    break
 
         log.info(
             "Image source: %s (primary_source=%s, support_scores=%s, img_chunks=%s)",
