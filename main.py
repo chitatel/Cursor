@@ -2051,11 +2051,11 @@ def _extract_pdf_with_images(path: Path, *, require_text_layer: bool = True) -> 
             except Exception:
                 drawings = []
             if drawings and page_area > 0:
-                # Считаем bbox всех vector-операций (исключаем границы строк
-                # текста — у них очень маленькая высота).
+                # Собираем прямоугольники из drawings, исключая мелочь
+                # (подчёркивания, штрихи, рамки символов).
+                rects: list[tuple[float, float, float, float]] = []
                 min_x, min_y = float("inf"), float("inf")
                 max_x, max_y = 0.0, 0.0
-                op_count = 0
                 for dr in drawings:
                     r = dr.get("rect")
                     if not r:
@@ -2067,28 +2067,59 @@ def _extract_pdf_with_images(path: Path, *, require_text_layer: bool = True) -> 
                             rx0, ry0, rx1, ry1 = r[0], r[1], r[2], r[3]
                         except Exception:
                             continue
-                    # отсекаем мелочь: подчёркивания, штрихи и т.п.
-                    if (rx1 - rx0) < 8 and (ry1 - ry0) < 8:
+                    w = rx1 - rx0
+                    h = ry1 - ry0
+                    if w < 8 and h < 8:
                         continue
+                    rects.append((rx0, ry0, rx1, ry1))
                     min_x = min(min_x, rx0)
                     min_y = min(min_y, ry0)
                     max_x = max(max_x, rx1)
                     max_y = max(max_y, ry1)
-                    op_count += 1
+                op_count = len(rects)
                 if op_count >= 20 and max_x > min_x and max_y > min_y:
                     gfx_area = (max_x - min_x) * (max_y - min_y)
                     gfx_ratio = gfx_area / page_area
-                    # Чтобы отличить настоящую блок-схему от текстовой страницы
-                    # с таблицей или рамкой: блок-схема занимает ≥45% страницы
-                    # И содержит мало текста (<800 символов).  Таблица с текстом
-                    # имеет много текста, но мало векторных операций; рамка —
-                    # мало операций, не пройдёт порог ≥20.
-                    if gfx_ratio >= 0.45 and len(page_text) < 800:
+                    # Чтобы отличить блок-схему от таблицы:
+                    # У ТАБЛИЦЫ ячейки регулярные — много прямоугольников
+                    # одинаковой ширины (≥3 разных значения), одинаковой
+                    # высоты.  X-координаты левых границ группируются в
+                    # 2-6 уникальных значений (столбцы).
+                    # У БЛОК-СХЕМЫ блоки разные по размеру и разбросаны по
+                    # странице — много уникальных X-координат, много уникальных
+                    # размеров.
+                    widths = [r[2] - r[0] for r in rects]
+                    heights = [r[3] - r[1] for r in rects]
+                    x_lefts = [round(r[0]) for r in rects]
+                    # Считаем «кластеры» по X-координате (с точностью 5pt)
+                    x_buckets = {round(x / 5.0) * 5 for x in x_lefts}
+                    n_x_clusters = len(x_buckets)
+                    # Уникальные ширины (с точностью 5pt)
+                    unique_widths = {round(w / 5.0) * 5 for w in widths}
+                    n_unique_widths = len(unique_widths)
+                    is_table_like = (
+                        n_x_clusters <= 6  # мало столбцов = таблица
+                        and n_unique_widths <= 5  # ячейки одинаковые
+                    )
+                    if (
+                        gfx_ratio >= 0.45
+                        and len(page_text) < 800
+                        and not is_table_like
+                    ):
                         has_vector_graphic = True
                         log.info(
-                            "[%s] page %d: vector graphic detected (%d ops, %.0f%% area, text=%d)",
+                            "[%s] page %d: vector graphic detected "
+                            "(%d ops, %.0f%% area, text=%d, x_clusters=%d, uniq_widths=%d)",
                             path.name, page_num + 1, op_count,
                             100.0 * gfx_ratio, len(page_text),
+                            n_x_clusters, n_unique_widths,
+                        )
+                    elif gfx_ratio >= 0.45 and len(page_text) < 800 and is_table_like:
+                        log.info(
+                            "[%s] page %d: table-like (%d ops, %.0f%% area, "
+                            "x_clusters=%d, uniq_widths=%d) — NOT a flowchart",
+                            path.name, page_num + 1, op_count,
+                            100.0 * gfx_ratio, n_x_clusters, n_unique_widths,
                         )
 
             # Шаг 2: выбор стратегии — слайд или документ?
