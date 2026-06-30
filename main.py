@@ -1616,32 +1616,38 @@ def _attach_images_to_answer(
     # Второй проход: если пункт не получил картинку, но упоминает имя файла
     # группы в своём тексте — привязываем.  Минимум 1 совпадающий токен имени
     # файла (достаточно специфично: «CTO.CNt-008.1.25»).
+    #
+    # Распределяем глобально по убыванию score, чтобы пункт с самым сильным
+    # совпадением (например, score=6 «СТО.CNt-008.1.25» в пункте 2) забрал
+    # «свою» группу раньше пункта со score=1 (случайное совпадение токена).
+    candidate_pairs: list[tuple[int, int, int]] = []  # (score, point_idx, group_idx)
     for i, point in enumerate(points):
         if point_assignments[i] >= 0:
             continue
         point_lower = point.lower()
-        best_idx = -1
-        best_score = 0
         for idx, (_preceding_bag, _urls, fn) in enumerate(groups):
             if idx in used_groups or not fn:
                 continue
             tokens = filename_tokens(fn)
             score = sum(1 for t in tokens if t in point_lower and len(t) >= 5)
-            if score > best_score:
-                best_score = score
-                best_idx = idx
-        if best_idx >= 0 and best_score >= 1:
-            used_groups.add(best_idx)
-            point_assignments[i] = best_idx
-            log.info(
-                "[attach_images] point %d → group %d (filename match score=%d, fn=%s)",
-                i + 1, best_idx, best_score, groups[best_idx][2],
-            )
-        else:
-            log.info(
-                "[attach_images] point %d: no filename match (best_score=%d)",
-                i + 1, best_score,
-            )
+            if score >= 1:
+                candidate_pairs.append((score, i, idx))
+    # Сортируем по убыванию score, при равенстве — по порядку появления пункта
+    candidate_pairs.sort(key=lambda t: (-t[0], t[1]))
+    for score, point_i, group_idx in candidate_pairs:
+        if point_assignments[point_i] >= 0:
+            continue
+        if group_idx in used_groups:
+            continue
+        used_groups.add(group_idx)
+        point_assignments[point_i] = group_idx
+        log.info(
+            "[attach_images] point %d → group %d (filename match score=%d, fn=%s)",
+            point_i + 1, group_idx, score, groups[group_idx][2],
+        )
+    for i in range(len(points)):
+        if point_assignments[i] < 0:
+            log.info("[attach_images] point %d: no filename match", i + 1)
 
     # Финальная сборка
     for point, group_idx in zip(points, point_assignments):
@@ -3481,6 +3487,51 @@ async def ask(req: AskRequest, request: Request):
                             image_urls[marker] = (
                                 f"{base}/files/{stem}_images/{img_name}"
                             )
+
+            # Top_K чанков покрывает только небольшую часть документа.  Чтобы
+            # картинки со ВСЕХ страниц документа-источника могли быть
+            # привязаны к ответу, подтягиваем все его чанки, содержащие
+            # маркеры [Рисунок ...].  Это не влияет на текст, который видит
+            # LLM (он уже сформирован), только на пул доступных картинок.
+            try:
+                src_records = await _document_records(_img_source_file)
+            except Exception as e:
+                log.warning("[attach_images] failed to load src records: %s", e)
+                src_records = []
+            seen_chunk_ids = {id(t) for t in _img_chunks}
+            extra_image_chunks = 0
+            for rec in src_records:
+                text = rec.get("text", "") or ""
+                if not img_marker_re.search(text):
+                    continue
+                # дедуп по содержанию, чтобы не задвоить уже взятые чанки
+                already = False
+                for existing in _img_chunks:
+                    if existing == text:
+                        already = True
+                        break
+                if already:
+                    continue
+                _img_chunks.append(text)
+                _img_metas.append({
+                    "filename": _img_source_file,
+                    "chunk_index": rec.get("chunk_index", -1),
+                })
+                for match in img_marker_re.finditer(text):
+                    img_name = match.group(2)
+                    marker = match.group(0)
+                    if marker not in image_urls:
+                        stem = Path(_img_source_file).stem
+                        image_urls[marker] = (
+                            f"{base}/files/{stem}_images/{img_name}"
+                        )
+                extra_image_chunks += 1
+            if extra_image_chunks:
+                log.info(
+                    "[attach_images] pulled %d extra image-chunks from source %s "
+                    "(total image_urls now: %d)",
+                    extra_image_chunks, _img_source_file, len(image_urls),
+                )
 
         # Привязываем иллюстрации к пунктам ответа — строго из одного документа
         if image_urls and answer != _not_found:
