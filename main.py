@@ -1989,8 +1989,34 @@ def _extract_pdf_with_images(path: Path, *, require_text_layer: bool = True) -> 
                     rect = fitz.Rect(bbox)
                     if rect.is_empty or rect.is_infinite:
                         continue
-                    if rect.width < 50 and rect.height < 50:
-                        continue  # декоративная иконка
+                    # Минимальный размер: ниже 150pt по одной из сторон —
+                    # это всегда логотип / иконка / штамп, не контент.
+                    # (Скриншоты UI и блок-схемы крупнее.)
+                    if rect.width < 150 or rect.height < 150:
+                        log.info(
+                            "[%s] page %d skip small image xref=%d (%.0fx%.0f pt)",
+                            path.name, page_num + 1, xref,
+                            rect.width, rect.height,
+                        )
+                        continue
+                    # Картинка в зоне header/footer (верхние 10% или нижние 10%
+                    # страницы) — это колонтитул с логотипом, отбрасываем.
+                    page_h = page.rect.height
+                    if page_h > 0:
+                        top_zone = 0.10 * page_h
+                        bottom_zone = 0.90 * page_h
+                        if rect.y1 <= top_zone:
+                            log.info(
+                                "[%s] page %d skip header image xref=%d",
+                                path.name, page_num + 1, xref,
+                            )
+                            continue
+                        if rect.y0 >= bottom_zone:
+                            log.info(
+                                "[%s] page %d skip footer image xref=%d",
+                                path.name, page_num + 1, xref,
+                            )
+                            continue
                     # Крупная картинка без текста сверху — декорация (титульная
                     # иллюстрация, фон).  Картинки с текстом-наложением
                     # (кнопки, плашки, иконки с подписями) проходят фильтр.
