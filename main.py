@@ -1736,6 +1736,111 @@ def _convert_docx_to_pdf_via_word(docx_path: Path, pdf_path: Path) -> bool:
             pass
 
 
+def _extract_emf_images_from_docx(
+    docx_path: Path,
+    images_dir: Path,
+    start_index: int,
+) -> list[str]:
+    """
+    Извлекает word/media/*.emf из docx-архива и конвертирует каждый файл
+    в PNG через PowerShell + System.Drawing (нативно есть на Windows).
+
+    EMF — это визуальные превью встроенных OLE-объектов (Visio схем,
+    Excel-таблиц, Word-документов). Word гарантированно сохраняет такие
+    превью при вставке OLE через "Insert Object", чтобы документ
+    нормально открывался на ПК без оригинального приложения.
+
+    Возвращает список имён созданных PNG (img_NNN.png) — каждое имя
+    продолжает нумерацию с start_index + 1.
+
+    Если PowerShell или System.Drawing недоступны (не-Windows),
+    возвращает пустой список.
+    """
+    import zipfile
+    import subprocess
+    import tempfile
+
+    created: list[str] = []
+    try:
+        with zipfile.ZipFile(str(docx_path), "r") as z:
+            emf_names = sorted([
+                n for n in z.namelist()
+                if n.startswith("word/media/") and n.lower().endswith(".emf")
+            ])
+            if not emf_names:
+                return []
+
+            images_dir.mkdir(exist_ok=True)
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tmpdir_path = Path(tmpdir)
+                counter = start_index
+                for emf_name in emf_names:
+                    try:
+                        emf_data = z.read(emf_name)
+                    except Exception as e:
+                        log.warning("[emf→png] failed to read %s: %s",
+                                    emf_name, e)
+                        continue
+                    tmp_emf = tmpdir_path / Path(emf_name).name
+                    try:
+                        tmp_emf.write_bytes(emf_data)
+                    except Exception as e:
+                        log.warning("[emf→png] failed to write tmp %s: %s",
+                                    emf_name, e)
+                        continue
+
+                    next_counter = counter + 1
+                    png_name = f"img_{next_counter:03d}.png"
+                    png_path = images_dir / png_name
+
+                    ps_script = (
+                        "Add-Type -AssemblyName System.Drawing; "
+                        f"$img = [System.Drawing.Image]::FromFile('{tmp_emf}'); "
+                        f"$img.Save('{png_path}', "
+                        "[System.Drawing.Imaging.ImageFormat]::Png); "
+                        "$img.Dispose()"
+                    )
+                    try:
+                        result = subprocess.run(
+                            [
+                                "powershell",
+                                "-NoProfile",
+                                "-ExecutionPolicy", "Bypass",
+                                "-Command", ps_script,
+                            ],
+                            capture_output=True,
+                            timeout=30,
+                            text=True,
+                        )
+                    except FileNotFoundError:
+                        log.warning(
+                            "[emf→png] powershell not found — EMF extraction "
+                            "skipped for %s", docx_path.name
+                        )
+                        return created
+                    except Exception as e:
+                        log.warning("[emf→png] subprocess failed for %s: %s",
+                                    emf_name, e)
+                        continue
+
+                    if result.returncode != 0 or not png_path.exists():
+                        log.warning(
+                            "[emf→png] conversion failed for %s "
+                            "(rc=%d): %s",
+                            emf_name, result.returncode,
+                            (result.stderr or "")[:200].strip(),
+                        )
+                        continue
+
+                    counter = next_counter
+                    created.append(png_name)
+                    log.info("[emf→png] %s → %s (%d bytes)",
+                             emf_name, png_name, png_path.stat().st_size)
+    except Exception as e:
+        log.warning("[%s] EMF extraction failed: %s", docx_path.name, e)
+    return created
+
+
 def _extract_docx_via_pdf_render(path: Path) -> Optional[list]:
     """
     Стратегия для docx с OLE-объектами (Visio-схемы):
@@ -1787,14 +1892,34 @@ def _extract_docx_via_pdf_render(path: Path) -> Optional[list]:
             except Exception:
                 pass
 
+        # Извлекаем EMF-превью встроенных OLE-объектов (Visio схемы и
+        # т.п.) напрямую из docx. Они дают точное визуальное
+        # представление без угадывания по drawings.
+        images_dir = FILES_DIR / f"{path.stem}_images"
+        existing_imgs = []
+        if images_dir.is_dir():
+            existing_imgs = sorted(images_dir.glob("img_*.png"))
+        start_idx = len(existing_imgs)
+        emf_pngs = _extract_emf_images_from_docx(path, images_dir, start_idx)
+
         # Подменяем metadata.filename на имя исходного docx
         result = []
-        for d in pdf_docs:
+        for i, d in enumerate(pdf_docs):
             new_meta = dict(getattr(d, "metadata", {}) or {})
             new_meta["filename"] = path.name
-            result.append(Document(text=getattr(d, "text", ""), metadata=new_meta))
+            text = getattr(d, "text", "")
+            # Маркеры EMF-картинок добавляем в конец текста первого
+            # документа — attach_images найдёт их через extra image-chunks.
+            if i == 0 and emf_pngs:
+                markers = [
+                    f"[Рисунок {start_idx + j + 1}: {png_name}]"
+                    for j, png_name in enumerate(emf_pngs)
+                ]
+                text = text + "\n\n" + "\n".join(markers)
+            result.append(Document(text=text, metadata=new_meta))
         log.info(
-            "[%s] extracted via Word→PDF render: %d docs", path.name, len(result),
+            "[%s] extracted via Word→PDF render: %d docs, +%d EMF images",
+            path.name, len(result), len(emf_pngs),
         )
         return result
     except Exception as e:
@@ -2045,69 +2170,11 @@ def _extract_pdf_with_images(path: Path, *, require_text_layer: bool = True) -> 
             # векторных операций (drawings).  Если такая графика занимает
             # заметную часть страницы — это блок-схема, рендерим страницу
             # целиком.
+            # Автодетектор block-схем по drawings отключён: на типовых
+            # Visio-схемах (белые блоки, чёрные контуры) ни один признак
+            # не отличает их от пустых форм с таблицами. Visio-схемы
+            # извлекаются напрямую из docx как EMF в _extract_docx_via_pdf_render.
             has_vector_graphic = False
-            try:
-                drawings = page.get_drawings()
-            except Exception:
-                drawings = []
-            if drawings and page_area > 0:
-                # Считаем прямоугольные «блоки» — фигуры нормальной
-                # пропорции (не тонкие линии и не штрихи). У блок-схемы
-                # Visio таких блоков много (≥50): прямоугольники, ромбы,
-                # обводки текста. У таблицы — это только ячейки (≤45).
-                n_blocks = 0
-                min_x, min_y = float("inf"), float("inf")
-                max_x, max_y = 0.0, 0.0
-                for dr in drawings:
-                    r = dr.get("rect")
-                    if not r:
-                        continue
-                    try:
-                        rx0, ry0, rx1, ry1 = r.x0, r.y0, r.x1, r.y1
-                    except Exception:
-                        try:
-                            rx0, ry0, rx1, ry1 = r[0], r[1], r[2], r[3]
-                        except Exception:
-                            continue
-                    w = rx1 - rx0
-                    h = ry1 - ry0
-                    if w < 8 and h < 8:
-                        continue
-                    min_x = min(min_x, rx0)
-                    min_y = min(min_y, ry0)
-                    max_x = max(max_x, rx1)
-                    max_y = max(max_y, ry1)
-                    # Тонкие линии (одна сторона ≤3pt) НЕ считаем блоками.
-                    if w <= 3 or h <= 3:
-                        continue
-                    n_blocks += 1
-                if max_x > min_x and max_y > min_y:
-                    gfx_area = (max_x - min_x) * (max_y - min_y)
-                    gfx_ratio = gfx_area / page_area
-                    # Единственный критерий: ≥50 прямоугольных блоков.
-                    # Реальные блок-схемы Visio (CNt-005.1.24 стр.13-16):
-                    #   blocks = 94-114 → detected.
-                    # Таблицы (стр.2 Реестр платежей; стр.20 Сбербанк):
-                    #   blocks = 30-42 → skip.
-                    # Текст на странице не ограничиваем — у Visio-схем
-                    # может быть много текста внутри блоков (CNt-005.1.24
-                    # стр.13 имеет text=457).
-                    if gfx_ratio >= 0.30 and n_blocks >= 50:
-                        has_vector_graphic = True
-                        log.info(
-                            "[%s] page %d: vector graphic detected "
-                            "(%.0f%% area, text=%d, blocks=%d)",
-                            path.name, page_num + 1,
-                            100.0 * gfx_ratio, len(page_text), n_blocks,
-                        )
-                    elif gfx_ratio >= 0.30 and n_blocks >= 20:
-                        log.info(
-                            "[%s] page %d: skip vector "
-                            "(%.0f%% area, text=%d, blocks=%d) "
-                            "— too few blocks for flowchart",
-                            path.name, page_num + 1,
-                            100.0 * gfx_ratio, len(page_text), n_blocks,
-                        )
 
             # Шаг 2: выбор стратегии — слайд или документ?
             # Слайд презентации:
