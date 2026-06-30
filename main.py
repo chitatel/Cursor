@@ -2082,24 +2082,30 @@ def _extract_pdf_with_images(path: Path, *, require_text_layer: bool = True) -> 
                     gfx_ratio = gfx_area / page_area
                     # Чтобы отличить блок-схему от таблицы:
                     # У ТАБЛИЦЫ ячейки регулярные — много прямоугольников
-                    # одинаковой ширины (≥3 разных значения), одинаковой
-                    # высоты.  X-координаты левых границ группируются в
-                    # 2-6 уникальных значений (столбцы).
-                    # У БЛОК-СХЕМЫ блоки разные по размеру и разбросаны по
-                    # странице — много уникальных X-координат, много уникальных
-                    # размеров.
+                    # одинаковой высоты (строки), сгруппированы в кластеры
+                    # по Y-координате.  Все Y-координаты прижаты к
+                    # небольшому числу уровней (5-30 строк) на регулярном
+                    # шаге.
+                    # У БЛОК-СХЕМЫ блоки разной высоты, разнобоя по Y,
+                    # уровни не образуют регулярную решётку.
                     widths = [r[2] - r[0] for r in rects]
                     heights = [r[3] - r[1] for r in rects]
                     x_lefts = [round(r[0]) for r in rects]
-                    # Считаем «кластеры» по X-координате (с точностью 5pt)
+                    y_tops = [round(r[1]) for r in rects]
+                    # Кластеры по координатам (точность 5pt)
                     x_buckets = {round(x / 5.0) * 5 for x in x_lefts}
+                    y_buckets = {round(y / 5.0) * 5 for y in y_tops}
                     n_x_clusters = len(x_buckets)
-                    # Уникальные ширины (с точностью 5pt)
-                    unique_widths = {round(w / 5.0) * 5 for w in widths}
-                    n_unique_widths = len(unique_widths)
+                    n_y_clusters = len(y_buckets)
+                    unique_heights = {round(h / 5.0) * 5 for h in heights}
+                    n_unique_heights = len(unique_heights)
+                    # Если в среднем на каждый Y-уровень приходится ≥3
+                    # прямоугольника одинаковой высоты — это строки таблицы.
+                    avg_per_y = op_count / max(n_y_clusters, 1)
                     is_table_like = (
-                        n_x_clusters <= 6  # мало столбцов = таблица
-                        and n_unique_widths <= 5  # ячейки одинаковые
+                        n_unique_heights <= 4   # 1-4 типа высоты строк
+                        and avg_per_y >= 3      # в среднем 3+ ячейки на строку
+                        and n_y_clusters >= 3   # минимум 3 строки таблицы
                     )
                     if (
                         gfx_ratio >= 0.45
@@ -2109,17 +2115,21 @@ def _extract_pdf_with_images(path: Path, *, require_text_layer: bool = True) -> 
                         has_vector_graphic = True
                         log.info(
                             "[%s] page %d: vector graphic detected "
-                            "(%d ops, %.0f%% area, text=%d, x_clusters=%d, uniq_widths=%d)",
+                            "(%d ops, %.0f%% area, text=%d, x_clusters=%d, "
+                            "y_clusters=%d, uniq_heights=%d, avg_per_y=%.1f)",
                             path.name, page_num + 1, op_count,
                             100.0 * gfx_ratio, len(page_text),
-                            n_x_clusters, n_unique_widths,
+                            n_x_clusters, n_y_clusters,
+                            n_unique_heights, avg_per_y,
                         )
                     elif gfx_ratio >= 0.45 and len(page_text) < 800 and is_table_like:
                         log.info(
                             "[%s] page %d: table-like (%d ops, %.0f%% area, "
-                            "x_clusters=%d, uniq_widths=%d) — NOT a flowchart",
+                            "y_clusters=%d, uniq_heights=%d, avg_per_y=%.1f) "
+                            "— NOT a flowchart",
                             path.name, page_num + 1, op_count,
-                            100.0 * gfx_ratio, n_x_clusters, n_unique_widths,
+                            100.0 * gfx_ratio, n_y_clusters,
+                            n_unique_heights, avg_per_y,
                         )
 
             # Шаг 2: выбор стратегии — слайд или документ?
