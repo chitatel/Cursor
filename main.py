@@ -1937,12 +1937,60 @@ def _extract_pdf_with_images(path: Path, *, require_text_layer: bool = True) -> 
             page_markers: list[str] = []
             zoom = fitz.Matrix(2, 2)  # 2x для читаемости текста
 
+            # Дополнительно: блок-схемы (Visio из docx, экспортированный через
+            # Word) часто становятся не растровой картинкой, а большим набором
+            # векторных операций (drawings).  Если такая графика занимает
+            # заметную часть страницы — это блок-схема, рендерим страницу
+            # целиком.
+            has_vector_graphic = False
+            try:
+                drawings = page.get_drawings()
+            except Exception:
+                drawings = []
+            if drawings and page_area > 0:
+                # Считаем bbox всех vector-операций (исключаем границы строк
+                # текста — у них очень маленькая высота).
+                min_x, min_y = float("inf"), float("inf")
+                max_x, max_y = 0.0, 0.0
+                op_count = 0
+                for dr in drawings:
+                    r = dr.get("rect")
+                    if not r:
+                        continue
+                    try:
+                        rx0, ry0, rx1, ry1 = r.x0, r.y0, r.x1, r.y1
+                    except Exception:
+                        try:
+                            rx0, ry0, rx1, ry1 = r[0], r[1], r[2], r[3]
+                        except Exception:
+                            continue
+                    # отсекаем мелочь: подчёркивания, штрихи и т.п.
+                    if (rx1 - rx0) < 8 and (ry1 - ry0) < 8:
+                        continue
+                    min_x = min(min_x, rx0)
+                    min_y = min(min_y, ry0)
+                    max_x = max(max_x, rx1)
+                    max_y = max(max_y, ry1)
+                    op_count += 1
+                if op_count >= 10 and max_x > min_x and max_y > min_y:
+                    gfx_area = (max_x - min_x) * (max_y - min_y)
+                    gfx_ratio = gfx_area / page_area
+                    # ≥25% страницы занято векторной графикой + минимум 10
+                    # операций — почти наверняка блок-схема, диаграмма, таблица
+                    if gfx_ratio >= 0.25:
+                        has_vector_graphic = True
+                        log.info(
+                            "[%s] page %d: vector graphic detected (%d ops, %.0f%% area)",
+                            path.name, page_num + 1, op_count, 100.0 * gfx_ratio,
+                        )
+
             # Шаг 2: выбор стратегии — слайд или документ?
             # Слайд презентации:
             #   - либо много визуальных элементов (≥4),
             #   - либо мало текста (<500 символов) + хотя бы одна крупная
             #     картинка (>15% площади) — это «титульный» слайд с большой
             #     декоративной иллюстрацией (как стр.2 FAQ с большой монетой)
+            #   - либо большая векторная графика (блок-схема из Visio)
             # Для слайдов рендерим всю страницу как одну картинку.
             # Для документных страниц (инструкция с парой скриншотов) —
             # каждую картинку отдельно.
@@ -1954,6 +2002,7 @@ def _extract_pdf_with_images(path: Path, *, require_text_layer: bool = True) -> 
             is_presentation = (
                 len(candidates) >= 4
                 or (page_text_len < 500 and has_large_image)
+                or has_vector_graphic
             )
             if is_presentation:
                 try:
@@ -1968,9 +2017,9 @@ def _extract_pdf_with_images(path: Path, *, require_text_layer: bool = True) -> 
                     marker = f"[Рисунок {img_counter}: {img_name}]"
                     page_markers.append(marker)
                     log.info(
-                        "[%s] page %d: presentation mode (cands=%d, text=%d, big_img=%s) → 1 full-page render: %s",
+                        "[%s] page %d: presentation mode (cands=%d, text=%d, big_img=%s, vector=%s) → 1 full-page render: %s",
                         path.name, page_num + 1, len(candidates),
-                        page_text_len, has_large_image, img_name,
+                        page_text_len, has_large_image, has_vector_graphic, img_name,
                     )
                 except Exception as e:
                     log.warning("[%s] page %d full-page render failed: %s",
@@ -3324,7 +3373,17 @@ async def ask(req: AskRequest, request: Request):
                 fn = meta["filename"]
                 _img_chunk_counts[fn] = _img_chunk_counts.get(fn, 0) + 1
 
-        _img_source_file = _primary_source if _primary_source in _img_chunk_counts else None
+        # Источник картинок — primary, если у него они есть.  Иначе —
+        # первый по support_score документ, у которого есть картинки
+        # (тогда блок-схема из документа №2 показывается, даже если
+        # текст ответа взят из №1).
+        if _primary_source and _primary_source in _img_chunk_counts:
+            _img_source_file = _primary_source
+        else:
+            _img_source_file = next(
+                (fn for fn in sources if fn in _img_chunk_counts),
+                None,
+            )
 
         log.info(
             "Image source: %s (primary_source=%s, support_scores=%s, img_chunks=%s)",
