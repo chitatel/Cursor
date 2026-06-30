@@ -2049,16 +2049,20 @@ def _extract_pdf_with_images(path: Path, *, require_text_layer: bool = True) -> 
                     max_x = max(max_x, rx1)
                     max_y = max(max_y, ry1)
                     op_count += 1
-                if op_count >= 10 and max_x > min_x and max_y > min_y:
+                if op_count >= 20 and max_x > min_x and max_y > min_y:
                     gfx_area = (max_x - min_x) * (max_y - min_y)
                     gfx_ratio = gfx_area / page_area
-                    # ≥25% страницы занято векторной графикой + минимум 10
-                    # операций — почти наверняка блок-схема, диаграмма, таблица
-                    if gfx_ratio >= 0.25:
+                    # Чтобы отличить настоящую блок-схему от текстовой страницы
+                    # с таблицей или рамкой: блок-схема занимает ≥45% страницы
+                    # И содержит мало текста (<800 символов).  Таблица с текстом
+                    # имеет много текста, но мало векторных операций; рамка —
+                    # мало операций, не пройдёт порог ≥20.
+                    if gfx_ratio >= 0.45 and len(page_text) < 800:
                         has_vector_graphic = True
                         log.info(
-                            "[%s] page %d: vector graphic detected (%d ops, %.0f%% area)",
-                            path.name, page_num + 1, op_count, 100.0 * gfx_ratio,
+                            "[%s] page %d: vector graphic detected (%d ops, %.0f%% area, text=%d)",
+                            path.name, page_num + 1, op_count,
+                            100.0 * gfx_ratio, len(page_text),
                         )
 
             # Шаг 2: выбор стратегии — слайд или документ?
