@@ -3375,11 +3375,16 @@ async def reindex_document(
         effective_cat = await _document_category(filename)
     else:
         effective_cat = _normalize_category(category)
-    # Удаляем старые чанки и картинки
+    # Удаляем старые чанки и картинки.
+    # ВАЖНО: для .md картинки НЕ трогаем — при реиндексации .md-файла
+    # его текст только читается с диска, картинки заново не скачиваются
+    # (в отличие от PDF/docx, которые пересобирают картинки из документа).
+    # Стереть папку тут = получить битые ссылки на картинки в ответе.
     await _delete_document_records(filename)
-    images_dir = FILES_DIR / f"{Path(filename).stem}_images"
-    if images_dir.is_dir():
-        shutil.rmtree(images_dir, ignore_errors=True)
+    if dest.suffix.lower() != ".md":
+        images_dir = FILES_DIR / f"{Path(filename).stem}_images"
+        if images_dir.is_dir():
+            shutil.rmtree(images_dir, ignore_errors=True)
     background_tasks.add_task(_run_indexing, filename, dest, effective_cat)
     return {"filename": filename, "status": "reindexing_started", "category": effective_cat}
 
@@ -3400,9 +3405,12 @@ async def reindex_all(background_tasks: BackgroundTasks):
             continue
         existing_cat = cats.get(fn)
         await _delete_document_records(fn)
-        images_dir = FILES_DIR / f"{dest.stem}_images"
-        if images_dir.is_dir():
-            shutil.rmtree(images_dir, ignore_errors=True)
+        # Для .md не сносим картинки — они не пересоздаются при
+        # реиндексации файла с диска (см. reindex_document).
+        if dest.suffix.lower() != ".md":
+            images_dir = FILES_DIR / f"{dest.stem}_images"
+            if images_dir.is_dir():
+                shutil.rmtree(images_dir, ignore_errors=True)
         background_tasks.add_task(_run_indexing, fn, dest, existing_cat)
         started.append(fn)
     return {"started": started, "skipped_already_indexing": skipped}
