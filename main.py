@@ -1198,13 +1198,16 @@ def _build_image_marker(index: int, filename: str, image_path: Path) -> str:
     """
     Формирует маркер картинки для встраивания в текст документа.
     Если vision captioning включён и удалось получить описание —
-    добавляет строку 'Изображение: <описание>' после маркера. Это делает
-    картинку поисковой (по содержимому) и помогает attach_images.
+    добавляет строку 'Изображение: <описание>' ПЕРЕД маркером.
+    Это критично для attach_images: он ищет группы по словам ПЕРЕД
+    маркером в чанке. Описание перед маркером = слова описания
+    попадают в preceding_bag того же рисунка, и bag-of-words matching
+    точно привяжет картинку к пункту ответа со связанным смыслом.
     """
     marker = f"[Рисунок {index}: {filename}]"
     caption = _describe_image_sync(image_path)
     if caption:
-        return f"{marker}\nИзображение: {caption}"
+        return f"Изображение: {caption}\n{marker}"
     return marker
 
 
