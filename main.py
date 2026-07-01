@@ -107,6 +107,15 @@ KB_PORTAL_VERIFY_SSL = bool(CONFIG.get("KB_PORTAL_VERIFY_SSL", True))
 # считаем его сканом и возвращаем 400 с понятной ошибкой.
 PDF_MIN_TEXT_CHARS = int(CONFIG.get("PDF_MIN_TEXT_CHARS", 200))
 
+# Автоописание картинок через vision-LLM (Gemma 4 E2B и т.п.).
+# Если включено — при индексации каждая картинка (PDF, docx, EMF) описывается
+# LLM, и описание встраивается в текст рядом с маркером [Рисунок N: file].
+# Это делает картинки поисковыми (по содержимому) и улучшает attach_images.
+# Отключай, если модель не поддерживает vision или индексация слишком медленная.
+IMAGE_DESCRIPTION_ENABLED = bool(CONFIG.get("IMAGE_DESCRIPTION_ENABLED", True))
+# Пустая строка = использовать OLLAMA_LLM_MODEL.
+IMAGE_DESCRIPTION_MODEL = str(CONFIG.get("IMAGE_DESCRIPTION_MODEL", "")).strip()
+
 # Размер батча для эмбеддингов при индексировании
 EMBED_BATCH_SIZE = int(CONFIG.get("EMBED_BATCH_SIZE", 32))
 # Максимум записей, которое отдаёт GET /logs за один запрос
@@ -1000,6 +1009,189 @@ async def _chat(messages: list[dict], max_tokens: int = 400) -> str:
         return content
 
 
+# ── Image captioning (vision LLM) ────────────────────────────────────────────
+#
+# Каждая картинка при индексации проходит через vision-модель (Gemma 4 E2B
+# и т.п.) — получаем краткое описание, которое встраиваем в текст документа.
+# Кэш по SHA256 в STORAGE_DIR/image_captions.json, чтобы реиндексация не
+# описывала уже виденные картинки повторно.
+
+_caption_cache: Optional[dict[str, str]] = None
+_caption_cache_dirty: bool = False
+
+
+def _caption_cache_file() -> Path:
+    return STORAGE_DIR / "image_captions.json"
+
+
+def _load_caption_cache() -> dict[str, str]:
+    global _caption_cache
+    if _caption_cache is None:
+        p = _caption_cache_file()
+        try:
+            if p.exists():
+                _caption_cache = json.loads(p.read_text(encoding="utf-8"))
+            else:
+                _caption_cache = {}
+        except Exception:
+            _caption_cache = {}
+    return _caption_cache
+
+
+def _save_caption_cache() -> None:
+    global _caption_cache_dirty
+    if not _caption_cache_dirty or _caption_cache is None:
+        return
+    p = _caption_cache_file()
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(
+            json.dumps(_caption_cache, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        _caption_cache_dirty = False
+    except Exception as e:
+        log.warning("[image_caption] cache save failed: %s", e)
+
+
+_IMAGE_CAPTION_PROMPT = (
+    "Опиши изображение кратко — одним-двумя предложениями на русском. "
+    "Если это блок-схема или диаграмма — назови тип и назначение. "
+    "Если это скриншот интерфейса или страница документа — укажи "
+    "заголовок и суть содержимого. Если это иконка, логотип или "
+    "простая иллюстрация — назови ключевые визуальные элементы. "
+    "Без предисловий, сразу описание."
+)
+
+
+async def _describe_image_async(image_bytes: bytes, model: str) -> str:
+    """Запрашивает описание картинки у vision-LLM через chat API."""
+    import base64
+    b64 = base64.b64encode(image_bytes).decode("ascii")
+
+    async with httpx.AsyncClient(timeout=120) as c:
+        headers = await _api_headers()
+        mode = _api_mode()
+
+        if mode == "openai":
+            url = f"{_openai_base_url()}/chat/completions"
+            payload = {
+                "model": model,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/png;base64,{b64}",
+                            },
+                        },
+                        {"type": "text", "text": _IMAGE_CAPTION_PROMPT},
+                    ],
+                }],
+                "stream": False,
+                "temperature": 0.0,
+                "max_tokens": 200,
+            }
+        else:
+            if mode == "openwebui":
+                url = _openwebui_ollama_chat_url()
+            else:
+                url = _chat_url()
+            # Ollama chat API: images ставим ПЕРЕД текстом (Gemma 4 doc).
+            payload = {
+                "model": model,
+                "messages": [{
+                    "role": "user",
+                    "content": _IMAGE_CAPTION_PROMPT,
+                    "images": [b64],
+                }],
+                "stream": False,
+                "think": False,
+                "options": {
+                    "temperature": 0.0,
+                    "num_predict": 200,
+                    "num_ctx": 4096,
+                },
+            }
+
+        response = await c.post(url, headers=headers, json=payload)
+        if response.status_code == 401 and OPENWEBUI_PASSWORD and OPENWEBUI_USER:
+            headers = await _api_headers(force_refresh=True)
+            response = await c.post(url, headers=headers, json=payload)
+        response.raise_for_status()
+        data = response.json()
+        if "choices" in data:
+            return data["choices"][0]["message"]["content"].strip()
+        return data.get("message", {}).get("content", "").strip()
+
+
+def _describe_image_sync(image_path: Path) -> str:
+    """
+    Синхронная обёртка (для использования из executor thread во время
+    индексации). Кэширует описания по SHA256 картинки. Возвращает пустую
+    строку при ошибке или если captioning отключён.
+    """
+    if not IMAGE_DESCRIPTION_ENABLED:
+        return ""
+    try:
+        data = image_path.read_bytes()
+    except Exception:
+        return ""
+    if not data:
+        return ""
+
+    import hashlib
+    sha = hashlib.sha256(data).hexdigest()
+
+    cache = _load_caption_cache()
+    if sha in cache:
+        return cache[sha]
+
+    model = IMAGE_DESCRIPTION_MODEL or OLLAMA_LLM_MODEL
+    try:
+        # Мы внутри executor thread — своего event loop нет, asyncio.run
+        # создаст временный.
+        caption = asyncio.run(_describe_image_async(data, model))
+    except Exception as e:
+        log.warning(
+            "[image_caption] %s failed (model=%s): %s",
+            image_path.name, model, e,
+        )
+        return ""
+
+    caption = (caption or "").strip()
+    if not caption:
+        return ""
+
+    # ограничим по длине на всякий случай (модель может выдать много)
+    if len(caption) > 600:
+        caption = caption[:600].rsplit(" ", 1)[0] + "…"
+
+    cache[sha] = caption
+    global _caption_cache_dirty
+    _caption_cache_dirty = True
+    log.info(
+        "[image_caption] %s → %d chars (model=%s)",
+        image_path.name, len(caption), model,
+    )
+    return caption
+
+
+def _build_image_marker(index: int, filename: str, image_path: Path) -> str:
+    """
+    Формирует маркер картинки для встраивания в текст документа.
+    Если vision captioning включён и удалось получить описание —
+    добавляет строку 'Изображение: <описание>' после маркера. Это делает
+    картинку поисковой (по содержимому) и помогает attach_images.
+    """
+    marker = f"[Рисунок {index}: {filename}]"
+    caption = _describe_image_sync(image_path)
+    if caption:
+        return f"{marker}\nИзображение: {caption}"
+    return marker
+
+
 # ── Query rewrite ─────────────────────────────────────────────────────────────
 
 async def _rewrite_query(q: str) -> str:
@@ -1649,11 +1841,20 @@ def _attach_images_to_answer(
         if point_assignments[i] < 0:
             log.info("[attach_images] point %d: no filename match", i + 1)
 
-    # Финальная сборка
+    # Финальная сборка с дедупликацией URL: одна и та же картинка может
+    # оказаться в нескольких chunks (из-за chunk_overlap), из них
+    # построятся разные groups с одинаковым URL, и разные пункты
+    # ответа могут получить дубликат. Не выводим URL, который уже был.
+    emitted_urls: set[str] = set()
     for point, group_idx in zip(points, point_assignments):
         if group_idx >= 0:
-            all_urls = "\n".join(groups[group_idx][1])
-            result_parts.append(f"{point}\n{all_urls}")
+            urls = [u for u in groups[group_idx][1] if u not in emitted_urls]
+            emitted_urls.update(urls)
+            if urls:
+                all_urls = "\n".join(urls)
+                result_parts.append(f"{point}\n{all_urls}")
+            else:
+                result_parts.append(point)
         else:
             result_parts.append(point)
 
@@ -1910,11 +2111,14 @@ def _extract_docx_via_pdf_render(path: Path) -> Optional[list]:
             text = getattr(d, "text", "")
             # Маркеры EMF-картинок добавляем в конец текста первого
             # документа — attach_images найдёт их через extra image-chunks.
+            # Каждая картинка проходит через vision-LLM (если включено),
+            # и её описание встраивается рядом с маркером.
             if i == 0 and emf_pngs:
-                markers = [
-                    f"[Рисунок {start_idx + j + 1}: {png_name}]"
-                    for j, png_name in enumerate(emf_pngs)
-                ]
+                markers = []
+                for j, png_name in enumerate(emf_pngs):
+                    idx = start_idx + j + 1
+                    png_path = images_dir / png_name
+                    markers.append(_build_image_marker(idx, png_name, png_path))
                 text = text + "\n\n" + "\n".join(markers)
             result.append(Document(text=text, metadata=new_meta))
         log.info(
@@ -2001,7 +2205,7 @@ def _extract_docx_with_images(path: Path) -> list:
                 img_name = f"img_{img_counter:03d}{ext}"
                 img_path = images_dir / img_name
                 img_path.write_bytes(img_data)
-                marker = f"[Рисунок {img_counter}: {img_name}]"
+                marker = _build_image_marker(img_counter, img_name, img_path)
                 para_images.setdefault(para_idx, []).append(marker)
                 log.info("[%s] Extracted image: %s", path.name, img_name)
 
@@ -2206,7 +2410,7 @@ def _extract_pdf_with_images(path: Path, *, require_text_layer: bool = True) -> 
                     img_name = f"img_{img_counter:03d}.png"
                     img_path = images_dir / img_name
                     img_path.write_bytes(img_bytes)
-                    marker = f"[Рисунок {img_counter}: {img_name}]"
+                    marker = _build_image_marker(img_counter, img_name, img_path)
                     page_markers.append(marker)
                     log.info(
                         "[%s] page %d: presentation mode (cands=%d, text=%d, big_img=%s, vector=%s) → 1 full-page render: %s",
@@ -2236,7 +2440,7 @@ def _extract_pdf_with_images(path: Path, *, require_text_layer: bool = True) -> 
                     img_name = f"img_{img_counter:03d}.png"
                     img_path = images_dir / img_name
                     img_path.write_bytes(img_bytes)
-                    marker = f"[Рисунок {img_counter}: {img_name}]"
+                    marker = _build_image_marker(img_counter, img_name, img_path)
                     seen_xrefs[xref] = marker
                     page_markers.append(marker)
                     log.info("[%s] Rendered image from page %d: %s (xref=%d, bbox=%s)",
@@ -2290,44 +2494,51 @@ def _extract_pdf_with_images(path: Path, *, require_text_layer: bool = True) -> 
 # ── Загрузка документов ───────────────────────────────────────────────────────
 
 def _load_documents(path: Path):
-    suffix = path.suffix.lower()
+    try:
+        suffix = path.suffix.lower()
 
-    if suffix == ".docx":
-        return _extract_docx_with_images(path)
+        if suffix == ".docx":
+            return _extract_docx_with_images(path)
 
-    if suffix == ".pdf":
-        return _extract_pdf_with_images(path)
+        if suffix == ".pdf":
+            return _extract_pdf_with_images(path)
 
-    if suffix == ".msg":
-        try:
-            import extract_msg
-            from llama_index.core.schema import Document
-        except ImportError as e:
-            raise RuntimeError("MSG support requires 'extract-msg' package") from e
+        if suffix == ".msg":
+            try:
+                import extract_msg
+                from llama_index.core.schema import Document
+            except ImportError as e:
+                raise RuntimeError(
+                    "MSG support requires 'extract-msg' package"
+                ) from e
 
-        message = extract_msg.Message(str(path))
-        parts = []
-        subject = (message.subject or "").strip()
-        sender = (message.sender or "").strip()
-        date = (message.date or "").strip()
-        body = (message.body or "").strip()
-        if subject:
-            parts.append(f"Subject: {subject}")
-        if sender:
-            parts.append(f"From: {sender}")
-        if date:
-            parts.append(f"Date: {date}")
-        if body:
-            parts.append("")
-            parts.append(body)
-        text = "\n".join(parts).strip()
-        if not text:
-            raise ValueError("No text extracted from MSG file")
-        return [Document(text=text, metadata={"filename": path.name})]
+            message = extract_msg.Message(str(path))
+            parts = []
+            subject = (message.subject or "").strip()
+            sender = (message.sender or "").strip()
+            date = (message.date or "").strip()
+            body = (message.body or "").strip()
+            if subject:
+                parts.append(f"Subject: {subject}")
+            if sender:
+                parts.append(f"From: {sender}")
+            if date:
+                parts.append(f"Date: {date}")
+            if body:
+                parts.append("")
+                parts.append(body)
+            text = "\n".join(parts).strip()
+            if not text:
+                raise ValueError("No text extracted from MSG file")
+            return [Document(text=text, metadata={"filename": path.name})]
 
-    from llama_index.core import SimpleDirectoryReader
+        from llama_index.core import SimpleDirectoryReader
 
-    return SimpleDirectoryReader(input_files=[str(path)]).load_data()
+        return SimpleDirectoryReader(input_files=[str(path)]).load_data()
+    finally:
+        # Сохраняем накопленные описания картинок на диск, чтобы при
+        # реиндексации не описывать те же самые повторно.
+        _save_caption_cache()
 
 
 def _detect_chunk_profile(texts: list[str]) -> tuple[str, int, int]:
@@ -2505,8 +2716,9 @@ async def _fetch_kb_article(url: str) -> tuple[str, str]:
                 img_url, img_resp.headers.get("content-type", "")
             )
             img_name = f"img_{img_counter:03d}.{ext}"
-            (images_dir / img_name).write_bytes(img_resp.content)
-            marker = f"[Рисунок {img_counter}: {img_name}]"
+            img_path = images_dir / img_name
+            img_path.write_bytes(img_resp.content)
+            marker = _build_image_marker(img_counter, img_name, img_path)
             img.replace_with(marker)
             log.info("[KB] saved image %s ← %s", img_name, img_url)
 
