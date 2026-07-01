@@ -1150,9 +1150,25 @@ def _describe_image_sync(image_path: Path) -> str:
 
     model = IMAGE_DESCRIPTION_MODEL or OLLAMA_LLM_MODEL
     try:
-        # Мы внутри executor thread — своего event loop нет, asyncio.run
-        # создаст временный.
-        caption = asyncio.run(_describe_image_async(data, model))
+        # Функция может вызываться и из sync executor thread (индексация
+        # PDF/docx), и из async функции (KB-статьи _fetch_kb_article).
+        # asyncio.run() валится в running loop → в этом случае запускаем
+        # корутину в отдельном thread'е со своим event loop.
+        try:
+            asyncio.get_running_loop()
+            in_running_loop = True
+        except RuntimeError:
+            in_running_loop = False
+
+        if in_running_loop:
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(
+                    asyncio.run, _describe_image_async(data, model)
+                )
+                caption = future.result(timeout=180)
+        else:
+            caption = asyncio.run(_describe_image_async(data, model))
     except Exception as e:
         log.warning(
             "[image_caption] %s failed (model=%s): %s",
