@@ -647,8 +647,32 @@ async def _search_records(
         record["id"]: _filename_match_boost(query, record["filename"])
         for record in lexical_records
     }
+    # Image chunk boost: при запросах про визуальные объекты (блок-схема,
+    # схема, диаграмма, инфографика) поднимаем чанки с маркерами картинок,
+    # даже если в тексте искомое слово встречается редко. Например,
+    # приложение к docx буквально называется «Блок-схема ...» — оно
+    # оказывается всего в одном чанке, но именно оно — цель поиска.
+    _VISUAL_QUERY_RE = re.compile(
+        r"блок[-\s]?схем|\bсхем[аеы]|диаграмм|инфографик",
+        re.IGNORECASE,
+    )
+    if _VISUAL_QUERY_RE.search(query):
+        image_marker_re = re.compile(r"\[Рисунок\s+\d+:\s*[^\]]+\]")
+        image_boost_by_id: dict[str, float] = {}
+        for record in lexical_records:
+            n_markers = len(image_marker_re.findall(record.get("text", "")))
+            if n_markers > 0:
+                # Плоский boost по факту наличия картинок в чанке.
+                # Величина сопоставима с типичным BM25-скором среднего
+                # совпадения (около 5-15), чтобы поднять чанк в топ, но
+                # не задавить осмысленные текстовые совпадения.
+                image_boost_by_id[record["id"]] = 10.0
+    else:
+        image_boost_by_id = {}
     lexical_scores = [
-        score + filename_scores_by_id.get(record["id"], 0.0)
+        score
+        + filename_scores_by_id.get(record["id"], 0.0)
+        + image_boost_by_id.get(record["id"], 0.0)
         for score, record in zip(bm25_scores, lexical_records)
     ]
     lexical_scores_by_id = {
