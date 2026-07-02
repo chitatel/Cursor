@@ -672,9 +672,9 @@ async def _search_records(
     # влиять на ранжирование документов. Подписи нужны для привязки
     # картинок к пунктам ответа; для поиска они учитываются только
     # отдельным адресным boost ниже.
-    _caption_span_re = re.compile(
-        r"Изображение:.*?(?=\[Рисунок\s+\d+:|\n\n|\Z)", re.DOTALL
-    )
+    # Подпись — всегда одна строка (нормализуется при генерации),
+    # поэтому вырезаем от префикса до конца строки.
+    _caption_span_re = re.compile(r"Изображение:[^\n]*")
     lexical_texts = [
         f"{record['filename']} {_caption_span_re.sub(' ', record['text'])}"
         for record in lexical_records
@@ -1314,10 +1314,29 @@ def _describe_image_sync(image_path: Path) -> str:
     if not caption:
         return ""
 
-    # ограничим по длине на всякий случай (модель может выдать много).
-    # 1200 — с учётом транскрипции текста на инфографике / блок-схемах.
-    if len(caption) > 1200:
-        caption = caption[:1200].rsplit(" ", 1)[0] + "…"
+    # Нормализация подписи. Цель — чтобы в тексте чанка подпись занимала
+    # РОВНО ОДНУ строку и выглядела для SentenceSplitter как одно
+    # предложение. Тогда чанкер не разрежет её посередине, и при поиске
+    # строку «Изображение: ...» можно надёжно вырезать из BM25-текста
+    # (иначе хвосты подписей без префикса неотличимы от текста документа
+    # и галлюцинации vision-модели ломают ранжирование).
+    caption = re.sub(r"\s+", " ", caption).strip()
+    # Дедупликация повторов: 2B-модель зацикливается и пишет одну и ту же
+    # фразу десятки раз («Блок-схема. Блок-схема. Блок-схема...»).
+    parts = re.split(r"(?<=[.;!?])\s+", caption)
+    seen_parts: set[str] = set()
+    unique_parts: list[str] = []
+    for part in parts:
+        key = part.strip().rstrip(".;!?…").lower()
+        if key and key not in seen_parts:
+            seen_parts.add(key)
+            unique_parts.append(part.strip())
+    caption = " ".join(unique_parts)
+    # Точки → точки с запятой, чтобы SentenceSplitter видел одно предложение
+    # и не разносил подпись по разным чанкам.
+    caption = re.sub(r"\.\s+", "; ", caption).rstrip(".")
+    if len(caption) > 600:
+        caption = caption[:600].rsplit(" ", 1)[0] + "…"
 
     cache[sha] = caption
     global _caption_cache_dirty
