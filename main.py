@@ -2321,6 +2321,155 @@ def _extract_docx_tables_text(path: Path) -> str:
     return "\n\n".join(parts)
 
 
+def _xlsx_text_from_bytes(data: bytes) -> str:
+    """Текст из xlsx: строки листов через « | » (stdlib, без openpyxl)."""
+    import io
+    import zipfile
+    import xml.etree.ElementTree as ET
+    out: list[str] = []
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            shared: list[str] = []
+            if "xl/sharedStrings.xml" in z.namelist():
+                root = ET.fromstring(z.read("xl/sharedStrings.xml"))
+                for si in root:
+                    shared.append("".join(
+                        t.text or "" for t in si.iter() if t.tag.endswith("}t")
+                    ))
+            for name in z.namelist():
+                if not re.match(r"xl/worksheets/sheet\d+\.xml$", name):
+                    continue
+                root = ET.fromstring(z.read(name))
+                for row in root.iter():
+                    if not row.tag.endswith("}row"):
+                        continue
+                    cells: list[str] = []
+                    for c in row:
+                        t_attr = c.get("t")
+                        v = next(
+                            (x.text for x in c.iter() if x.tag.endswith("}v")),
+                            None,
+                        )
+                        if v is None:
+                            is_el = next(
+                                (x for x in c.iter() if x.tag.endswith("}is")),
+                                None,
+                            )
+                            if is_el is not None:
+                                v = "".join(
+                                    t.text or "" for t in is_el.iter()
+                                    if t.tag.endswith("}t")
+                                )
+                        if v is None:
+                            continue
+                        if t_attr == "s":
+                            try:
+                                v = shared[int(v)]
+                            except (ValueError, IndexError):
+                                pass
+                        v = str(v).strip()
+                        if v:
+                            cells.append(v)
+                    if cells:
+                        out.append(" | ".join(cells))
+    except Exception as e:
+        log.warning("[embedded xlsx] extraction failed: %s", e)
+    return "\n".join(out)
+
+
+def _vsdx_text_from_bytes(data: bytes) -> str:
+    """Текст фигур Visio (vsdx): подписи блоков и стрелок блок-схем."""
+    import io
+    import zipfile
+    import xml.etree.ElementTree as ET
+    texts: list[str] = []
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            for name in sorted(z.namelist()):
+                if not (name.startswith("visio/pages/") and name.endswith(".xml")):
+                    continue
+                try:
+                    root = ET.fromstring(z.read(name))
+                except Exception:
+                    continue
+                for el in root.iter():
+                    if el.tag.endswith("}Text"):
+                        t = re.sub(r"\s+", " ", "".join(el.itertext())).strip()
+                        if t:
+                            texts.append(t)
+    except Exception as e:
+        log.warning("[embedded vsdx] extraction failed: %s", e)
+    return "\n".join(texts)
+
+
+def _docx_text_from_bytes(data: bytes) -> str:
+    """Текст встроенного docx: параграфы + таблицы."""
+    import io
+    try:
+        from docx import Document as DocxDocument
+        doc = DocxDocument(io.BytesIO(data))
+    except Exception as e:
+        log.warning("[embedded docx] extraction failed: %s", e)
+        return ""
+    parts: list[str] = []
+    for para in doc.paragraphs:
+        t = para.text.strip()
+        if t:
+            parts.append(t)
+    for table in doc.tables:
+        try:
+            tt = _table_rows_text(table)
+        except Exception:
+            continue
+        if tt:
+            parts.append(tt)
+    return "\n".join(parts)
+
+
+def _extract_docx_embedded_text(path: Path) -> str:
+    """
+    Извлекает текст из встроенных OLE-объектов docx (word/embeddings/*):
+    xlsx — таблицы, docx — вложенные приложения, vsdx — текст блок-схем
+    Visio. Приложения к СТО часто вставлены именно так: python-docx их
+    не видит, а Word→PDF рендерит только EMF-превью без текстового слоя.
+    Старые бинарные форматы (.doc/.xls) пропускаются.
+    """
+    import zipfile
+    parts: list[str] = []
+    try:
+        with zipfile.ZipFile(str(path)) as z:
+            emb_names = sorted(
+                n for n in z.namelist() if n.startswith("word/embeddings/")
+            )
+            for name in emb_names:
+                lower = name.lower()
+                try:
+                    data = z.read(name)
+                except Exception:
+                    continue
+                if lower.endswith(".xlsx"):
+                    text = _xlsx_text_from_bytes(data)
+                elif lower.endswith(".docx"):
+                    text = _docx_text_from_bytes(data)
+                elif lower.endswith(".vsdx"):
+                    text = _vsdx_text_from_bytes(data)
+                else:
+                    log.info(
+                        "[%s] embedded %s skipped (unsupported format)",
+                        path.name, Path(name).name,
+                    )
+                    continue
+                text = text.strip()
+                if not text:
+                    continue
+                if len(text) > 6000:
+                    text = text[:6000].rsplit(" ", 1)[0] + "…"
+                parts.append(f"Встроенный объект ({Path(name).name}):\n{text}")
+    except Exception as e:
+        log.warning("[%s] embedded objects extraction failed: %s", path.name, e)
+    return "\n\n".join(parts)
+
+
 def _extract_docx_via_pdf_render(path: Path) -> Optional[list]:
     """
     Стратегия для docx с OLE-объектами (Visio-схемы):
@@ -2415,6 +2564,22 @@ def _extract_docx_via_pdf_render(path: Path) -> Optional[list]:
             log.info(
                 "[%s] appended structured tables: %d chars",
                 path.name, len(tables_text),
+            )
+
+        # Текст встроенных OLE-объектов (приложения-Excel, вложенные docx,
+        # блок-схемы Visio) — иначе содержимое приложений не ищется вообще.
+        embedded_text = _extract_docx_embedded_text(path)
+        if embedded_text:
+            result.append(Document(
+                text=(
+                    "Приложения (встроенные объекты документа):\n\n"
+                    f"{embedded_text}"
+                ),
+                metadata={"filename": path.name},
+            ))
+            log.info(
+                "[%s] appended embedded objects text: %d chars",
+                path.name, len(embedded_text),
             )
         log.info(
             "[%s] extracted via Word→PDF render: %d docs, +%d EMF images",
@@ -2541,6 +2706,21 @@ def _extract_docx_with_images(path: Path) -> list:
                 parts.append(table_text)
 
     full_text = "\n".join(parts).strip()
+
+    # Текст встроенных OLE-объектов — на случай, когда docx с OLE попал
+    # сюда через fallback (Word COM недоступен/упал).
+    embedded_text = _extract_docx_embedded_text(path)
+    if embedded_text:
+        full_text = (
+            full_text
+            + "\n\nПриложения (встроенные объекты документа):\n\n"
+            + embedded_text
+        ).strip()
+        log.info(
+            "[%s] appended embedded objects text: %d chars",
+            path.name, len(embedded_text),
+        )
+
     if not full_text:
         raise ValueError("No text extracted from DOCX file")
 
