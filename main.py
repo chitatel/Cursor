@@ -470,7 +470,22 @@ def _bm25_scores(query: str, texts: list[str], k1: float = 1.5, b: float = 0.75)
     основные морфологические вариации русского языка без внешнего стеммера.
     """
     _STEM_LEN = 5
-    tokenize = lambda t: re.findall(r"[A-Za-zА-Яа-яЁё0-9]+", t.lower())
+
+    def tokenize(t: str) -> list[str]:
+        """
+        Токенизация с сохранением дефисных составных.
+        Составное «блок-схема» эмитится и как единый редкий токен
+        (высокий IDF, точечно матчит документ с реальной блок-схемой),
+        и как отдельные части — чтобы запрос «схема» всё ещё матчился.
+        """
+        raw = re.findall(r"[A-Za-zА-Яа-яЁё0-9]+(?:-[A-Za-zА-Яа-яЁё0-9]+)*", t.lower())
+        result: list[str] = []
+        for tok in raw:
+            result.append(tok)
+            if "-" in tok:
+                result.extend(part for part in tok.split("-") if part)
+        return result
+
     q_tokens = set(tokenize(query))
     if not q_tokens:
         return [0.0] * len(texts)
@@ -537,10 +552,20 @@ def _filename_match_boost(query: str, filename: str) -> float:
     "согласует" матчится с "согласующего" в имени файла.
     """
     _STEM_LEN = 5
-    query_tokens = set(re.findall(r"[A-Za-zА-Яа-яЁё0-9]+", query.lower()))
+
+    def _tokens(text: str) -> set[str]:
+        raw = re.findall(r"[A-Za-zА-Яа-яЁё0-9]+(?:-[A-Za-zА-Яа-яЁё0-9]+)*", text.lower())
+        result: set[str] = set()
+        for tok in raw:
+            result.add(tok)
+            if "-" in tok:
+                result.update(part for part in tok.split("-") if part)
+        return result
+
+    query_tokens = _tokens(query)
     if not query_tokens:
         return 0.0
-    filename_tokens = set(re.findall(r"[A-Za-zА-Яа-яЁё0-9]+", Path(filename).stem.lower()))
+    filename_tokens = _tokens(Path(filename).stem)
     if not filename_tokens:
         return 0.0
 
