@@ -673,27 +673,45 @@ async def _search_records(
         for record in lexical_records
     }
     # Image chunk boost: при запросах про визуальные объекты (блок-схема,
-    # схема, диаграмма, инфографика) поднимаем чанки с маркерами картинок,
-    # даже если в тексте искомое слово встречается редко. Например,
-    # приложение к docx буквально называется «Блок-схема ...» — оно
-    # оказывается всего в одном чанке, но именно оно — цель поиска.
-    _VISUAL_QUERY_RE = re.compile(
-        r"блок[-\s]?схем|\bсхем[аеы]|диаграмм|инфографик",
-        re.IGNORECASE,
-    )
-    if _VISUAL_QUERY_RE.search(query):
-        image_marker_re = re.compile(r"\[Рисунок\s+\d+:\s*[^\]]+\]")
-        image_boost_by_id: dict[str, float] = {}
+    # схема, диаграмма, инфографика) поднимаем чанки, у которых визуальный
+    # термин из запроса встречается ВНУТРИ подписи картинки [Рисунок N: ...].
+    # Плоский boost «за наличие картинки» не работает: он одинаково поднимает
+    # и скриншоты 1С, и настоящую блок-схему. Адресный boost поднимает только
+    # чанк, чья картинка подписана как искомый визуальный объект.
+    _VISUAL_TERMS = [
+        r"блок[-\s]?схем",
+        r"\bсхем[аеы]",
+        r"диаграмм",
+        r"инфографик",
+    ]
+    query_visual_terms = [
+        p for p in _VISUAL_TERMS if re.search(p, query, re.IGNORECASE)
+    ]
+    image_boost_by_id: dict[str, float] = {}
+    if query_visual_terms:
+        image_marker_re = re.compile(r"\[Рисунок\s+\d+:\s*([^\]]+)\]")
+        # Диагностика: где вообще встречается визуальный термин запроса
+        _term_hits_by_file: dict[str, int] = {}
+        _first_term = query_visual_terms[0]
         for record in lexical_records:
-            n_markers = len(image_marker_re.findall(record.get("text", "")))
-            if n_markers > 0:
-                # Плоский boost по факту наличия картинок в чанке.
-                # Величина сопоставима с типичным BM25-скором среднего
-                # совпадения (около 5-15), чтобы поднять чанк в топ, но
-                # не задавить осмысленные текстовые совпадения.
+            text = record.get("text", "")
+            n_hits = len(re.findall(_first_term, text, re.IGNORECASE))
+            if n_hits:
+                fn = record["filename"]
+                _term_hits_by_file[fn] = _term_hits_by_file.get(fn, 0) + n_hits
+            captions = image_marker_re.findall(text)
+            if not captions:
+                continue
+            caption_text = " ".join(captions)
+            if any(
+                re.search(p, caption_text, re.IGNORECASE)
+                for p in query_visual_terms
+            ):
                 image_boost_by_id[record["id"]] = 10.0
-    else:
-        image_boost_by_id = {}
+        log.info(
+            "[visual-query] term %r occurrences by file: %s; boosted chunks: %d",
+            _first_term, _term_hits_by_file, len(image_boost_by_id),
+        )
     lexical_scores = [
         score
         + filename_scores_by_id.get(record["id"], 0.0)
@@ -711,6 +729,21 @@ async def _search_records(
     ]
 
     fused_ids = _rrf_fusion(vector_ids, lexical_ids, bm25_weight=BM25_WEIGHT)[:top_k]
+
+    log.info(
+        "[retrieval] top fused: %s",
+        [
+            (
+                id_to_record[i]["filename"][:45],
+                id_to_record[i].get("chunk_index", 0),
+                round(lexical_scores_by_id.get(i, 0.0), 2),
+                round(1 - vector_distances.get(i, 1.0), 3),
+                round(image_boost_by_id.get(i, 0.0), 1),
+            )
+            for i in fused_ids
+            if i in id_to_record
+        ],
+    )
 
     ids: list[str] = []
     docs: list[str] = []
