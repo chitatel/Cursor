@@ -2224,6 +2224,50 @@ def _extract_emf_images_from_docx(
     return created
 
 
+def _table_rows_text(table) -> str:
+    """
+    Превращает таблицу python-docx в текст: одна строка таблицы — одна
+    строка текста, ячейки через « | ». Объединённые ячейки в docx
+    повторяют текст — последовательные дубли схлопываются.
+    """
+    lines: list[str] = []
+    for row in table.rows:
+        cells = [re.sub(r"\s+", " ", cell.text).strip() for cell in row.cells]
+        deduped: list[str] = []
+        for cell_text in cells:
+            if not deduped or cell_text != deduped[-1]:
+                deduped.append(cell_text)
+        line = " | ".join(c for c in deduped if c)
+        if line:
+            lines.append(line)
+    return "\n".join(lines)
+
+
+def _extract_docx_tables_text(path: Path) -> str:
+    """
+    Извлекает все таблицы docx как структурированный текст.
+    Нужно для пути Word→PDF: PyMuPDF вытаскивает текст ячеек вразброс,
+    и связь «строка таблицы» теряется. Этот текст добавляется к
+    результату отдельным блоком, чтобы retrieval и LLM видели строки
+    таблиц целиком (например, «Этап | Срок | Ответственный»).
+    """
+    try:
+        from docx import Document as DocxDocument
+        doc = DocxDocument(str(path))
+    except Exception as e:
+        log.warning("[%s] table extraction failed: %s", path.name, e)
+        return ""
+    parts: list[str] = []
+    for t_idx, table in enumerate(doc.tables, start=1):
+        try:
+            rows_text = _table_rows_text(table)
+        except Exception:
+            continue
+        if rows_text:
+            parts.append(f"Таблица {t_idx}:\n{rows_text}")
+    return "\n\n".join(parts)
+
+
 def _extract_docx_via_pdf_render(path: Path) -> Optional[list]:
     """
     Стратегия для docx с OLE-объектами (Visio-схемы):
@@ -2303,6 +2347,22 @@ def _extract_docx_via_pdf_render(path: Path) -> Optional[list]:
                     markers.append(_build_image_marker(idx, png_name, png_path))
                 text = text + "\n\n" + "\n".join(markers)
             result.append(Document(text=text, metadata=new_meta))
+
+        # PyMuPDF вытаскивает текст таблиц из отрендеренного PDF вразброс
+        # (ячейки отдельными блоками) — связь «строка таблицы» теряется.
+        # Добавляем таблицы из docx структурированным блоком: retrieval
+        # найдёт строку целиком («Этап | Срок | Ответственный»), и LLM
+        # сможет отвечать на вопросы по табличным данным.
+        tables_text = _extract_docx_tables_text(path)
+        if tables_text:
+            result.append(Document(
+                text=f"Таблицы документа:\n\n{tables_text}",
+                metadata={"filename": path.name},
+            ))
+            log.info(
+                "[%s] appended structured tables: %d chars",
+                path.name, len(tables_text),
+            )
         log.info(
             "[%s] extracted via Word→PDF render: %d docs, +%d EMF images",
             path.name, len(result), len(emf_pngs),
@@ -2346,9 +2406,11 @@ def _extract_docx_with_images(path: Path) -> list:
     images_dir = FILES_DIR / f"{stem}_images"
     images_dir.mkdir(exist_ok=True)
 
-    # Собираем все inline-изображения с привязкой к параграфам
+    # Собираем все inline-изображения с привязкой к параграфам.
+    # Ключ — XML-элемент параграфа: он стабилен и позволяет найти маркеры
+    # при обходе body в порядке следования (параграфы + таблицы).
     img_counter = 0
-    para_images: dict[int, list[str]] = {}  # para_index -> list of markers
+    para_images: dict = {}  # w:p element -> list of markers
 
     for para_idx, para in enumerate(doc.paragraphs):
         for run in para.runs:
@@ -2388,18 +2450,32 @@ def _extract_docx_with_images(path: Path) -> list:
                 img_path = images_dir / img_name
                 img_path.write_bytes(img_data)
                 marker = _build_image_marker(img_counter, img_name, img_path)
-                para_images.setdefault(para_idx, []).append(marker)
+                para_images.setdefault(para._element, []).append(marker)
                 log.info("[%s] Extracted image: %s", path.name, img_name)
 
-    # Собираем текст с маркерами
+    # Собираем текст с маркерами, обходя body в порядке следования:
+    # doc.paragraphs НЕ содержит текст таблиц, поэтому таблицы включаем
+    # явно — построчно, в той позиции документа, где они стоят.
+    from docx.oxml.ns import qn
+    from docx.table import Table as DocxTable
+    from docx.text.paragraph import Paragraph as DocxParagraph
+
     parts = []
-    for para_idx, para in enumerate(doc.paragraphs):
-        text = para.text.strip()
-        if text:
-            parts.append(text)
-        if para_idx in para_images:
-            for marker in para_images[para_idx]:
+    for child in doc.element.body.iterchildren():
+        if child.tag == qn("w:p"):
+            para = DocxParagraph(child, doc)
+            text = para.text.strip()
+            if text:
+                parts.append(text)
+            for marker in para_images.get(child, []):
                 parts.append(marker)
+        elif child.tag == qn("w:tbl"):
+            try:
+                table_text = _table_rows_text(DocxTable(child, doc))
+            except Exception:
+                table_text = ""
+            if table_text:
+                parts.append(table_text)
 
     full_text = "\n".join(parts).strip()
     if not full_text:
