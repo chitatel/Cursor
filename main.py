@@ -602,6 +602,17 @@ def _rrf_fusion(
     return sorted(scores, key=lambda x: scores[x], reverse=True)
 
 
+# Термины «визуальных» запросов: блок-схема, схема, диаграмма, инфографика.
+# Используются и для boost чанков с картинками в _search_records, и для
+# каталожного ответа на навигационные запросы в /ask.
+_VISUAL_TERMS = [
+    r"блок[-\s]?схем",
+    r"\bсхем[аеы]",
+    r"диаграмм",
+    r"инфографик",
+]
+
+
 async def _search_records(
     query: str,
     query_embedding: list[float],
@@ -690,12 +701,6 @@ async def _search_records(
     # Плоский boost «за наличие картинки» не работает: он одинаково поднимает
     # и скриншоты 1С, и настоящую блок-схему. Адресный boost поднимает только
     # чанк, чья картинка подписана как искомый визуальный объект.
-    _VISUAL_TERMS = [
-        r"блок[-\s]?схем",
-        r"\bсхем[аеы]",
-        r"диаграмм",
-        r"инфографик",
-    ]
     query_visual_terms = [
         p for p in _VISUAL_TERMS if re.search(p, query, re.IGNORECASE)
     ]
@@ -1796,6 +1801,83 @@ def _document_support_scores(
 
 
 # ── Форматирование ответа в HTML ─────────────────────────────────────────────
+
+def _catalog_title_and_refine(filename: str) -> tuple[str, str]:
+    """
+    Человекочитаемое название файла и слова для уточняющего запроса.
+    Склейки вида «поставщиковТермолэнд» разлепляются; коды СТО, даты и
+    короткие служебные токены отбрасываются.
+    """
+    stem = Path(filename).stem
+    stem_spaced = re.sub(r"(?<=[а-яё])(?=[А-ЯЁ])", " ", stem)
+    words = re.findall(r"[А-Яа-яЁё]{4,}", stem_spaced)
+    refine = " ".join(words[:4]).lower()
+    return stem_spaced.strip(), refine
+
+
+def _visual_catalog_answer(
+    question: str,
+    ranked_files: list[str],
+    records: list[dict],
+    max_items: int = 10,
+) -> Optional[tuple[str, list[str], list[str]]]:
+    """
+    Каталожный ответ для навигационного «визуального» запроса («блок-схема»
+    без уточнения). Если документов с подходящими картинками несколько,
+    вместо генерации LLM возвращаем детерминированный список: документ +
+    подпись схемы + готовый уточняющий запрос.
+
+    Возвращает (answer_text, suggested_queries, files) или None, если
+    подходящих документов меньше двух (тогда обычный поток ответит лучше).
+    """
+    terms = [p for p in _VISUAL_TERMS if re.search(p, question, re.IGNORECASE)]
+    if not terms:
+        return None
+    # Слово запроса, задающее тип визуала («блок-схема») — префикс
+    # уточняющих запросов.
+    term_word = next(
+        (
+            w for w in re.findall(r"[А-Яа-яЁёA-Za-z-]+", question)
+            if any(re.search(p, w, re.IGNORECASE) for p in terms)
+        ),
+        "схема",
+    ).lower()
+
+    caption_re = re.compile(r"Изображение:\s*([^\n]+)")
+    caption_by_file: dict[str, str] = {}
+    for rec in records:
+        fn = rec["filename"]
+        if fn in caption_by_file:
+            continue
+        for cap in caption_re.findall(rec.get("text", "") or ""):
+            if any(re.search(p, cap, re.IGNORECASE) for p in terms):
+                caption_by_file[fn] = cap.strip()
+                break
+    if len(caption_by_file) < 2:
+        return None
+
+    # Порядок: сначала файлы из выдачи retrieval (по рангу), затем остальные
+    ordered = [fn for fn in ranked_files if fn in caption_by_file]
+    ordered += sorted(fn for fn in caption_by_file if fn not in ordered)
+    ordered = ordered[:max_items]
+
+    lines = [
+        f"Нашлось несколько документов, где есть {term_word}. Уточните "
+        "запрос — можно скопировать строку «Спросите» нужного пункта:",
+        "",
+    ]
+    suggested: list[str] = []
+    for fn in ordered:
+        title, refine = _catalog_title_and_refine(fn)
+        cap = caption_by_file[fn]
+        if len(cap) > 160:
+            cap = cap[:160].rsplit(" ", 1)[0] + "…"
+        sq = f"{term_word} {refine}".strip() if refine else term_word
+        suggested.append(sq)
+        lines.append(f"• {title} — {cap}")
+        lines.append(f"  Спросите: «{sq}»")
+    return "\n".join(lines), suggested, ordered
+
 
 def _answer_to_html(
     answer: str,
@@ -3474,6 +3556,9 @@ class AskResponse(BaseModel):
     image_urls: dict[str, str]
     raw_chunks: list[str]
     rewritten_query: Optional[str] = None
+    # Готовые уточняющие запросы (каталожный ответ на навигационный
+    # запрос типа «блок-схема»). 1С может отрисовать их кликабельными.
+    suggested_queries: list[str] = []
 
 
 class UploadResponse(BaseModel):
@@ -4103,6 +4188,69 @@ async def ask(req: AskRequest, request: Request):
                 raw_chunks=[],
                 rewritten_query=rewritten,
             )
+
+        # ── Каталог схем для навигационных запросов ──
+        # «блок-схема» без других значимых слов — это навигация, а не
+        # вопрос: если документов с подходящими схемами несколько, не
+        # гадаем, какая нужна, а возвращаем список с готовыми уточняющими
+        # запросами. Запрос с уточнением («блок-схема банковское
+        # финансирование») идёт обычным потоком.
+        _catalog_terms = [
+            p for p in _VISUAL_TERMS
+            if re.search(p, req.question, re.IGNORECASE)
+        ]
+        if _catalog_terms:
+            # Вырезаем визуальные термины целиком (включая «блок-» в
+            # «блок-схема») и смотрим, осталось ли в запросе что-то
+            # значимое. Осталось — это уточнённый запрос, обычный поток.
+            _stripped_q = req.question
+            for _p in _catalog_terms:
+                _stripped_q = re.sub(
+                    rf"[А-Яа-яЁёA-Za-z-]*(?:{_p})[А-Яа-яЁёA-Za-z]*",
+                    " ",
+                    _stripped_q,
+                    flags=re.IGNORECASE,
+                )
+            _filler_words = {
+                "покажи", "показать", "покажите", "найди", "найти",
+                "найдите", "нужна", "нужен", "нужно", "выведи",
+                "вывести", "есть", "какие", "какая",
+            }
+            _rest_words = [
+                w for w in re.findall(r"[А-Яа-яЁёA-Za-z]{4,}", _stripped_q)
+                if w.lower() not in _filler_words
+            ]
+            if not _rest_words:
+                _ranked_files = list(
+                    dict.fromkeys(m["filename"] for m in metas)
+                )
+                _catalog = _visual_catalog_answer(
+                    req.question, _ranked_files, await _get_records()
+                )
+                if _catalog:
+                    _cat_answer, _cat_suggested, _cat_files = _catalog
+                    _cat_base = _public_base_url(request)
+                    _cat_downloads = {
+                        fn: f"{_cat_base}/files/{fn}" for fn in _cat_files
+                    }
+                    log.info(
+                        "[catalog] visual navigation query → %d items: %s",
+                        len(_cat_files), _cat_suggested,
+                    )
+                    log_entry["answer"] = _cat_answer
+                    return AskResponse(
+                        answer=_cat_answer,
+                        answer_html=_answer_to_html(
+                            _cat_answer, {}, _cat_downloads
+                        ),
+                        sources=_cat_files,
+                        chunks_used=0,
+                        download_urls=_cat_downloads,
+                        image_urls={},
+                        raw_chunks=[],
+                        rewritten_query=rewritten,
+                        suggested_queries=_cat_suggested,
+                    )
 
         # Файловая аффинность к запросу: если длинное слово запроса
         # содержится в имени файла подстрокой (включая склейки типа
