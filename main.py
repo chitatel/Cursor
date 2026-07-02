@@ -534,9 +534,16 @@ def _bm25_scores(query: str, texts: list[str], k1: float = 1.5, b: float = 0.75)
                 continue
             idf = math.log((n_docs - df + 0.5) / (df + 0.5) + 1)
             tf = tf_map.get(term, 0)
+            prefix_only = False
             if tf == 0 and len(term) >= _STEM_LEN:
                 tf = prefix_tf.get(term[:_STEM_LEN], 0)
+                prefix_only = True
             tf_norm = tf * (k1 + 1) / (tf + k1 * (1 - b + b * dl / avg_dl))
+            # Совпадение только по 5-буквенному префиксу слабее точного:
+            # запрос «пунктуальность» не должен тонуть в документах про
+            # «пункты протокола» (у них общий префикс «пункт»).
+            if prefix_only:
+                tf_norm *= 0.6
             score += idf * tf_norm
         scores.append(score)
     return scores
@@ -758,13 +765,39 @@ async def _search_records(
             bonus = sum(3.0 for pat in _pair_patterns if pat.search(text))
             proximity_bonus[i] = min(bonus, 9.0)
 
+    # Бонус за слова запроса в ПОДПИСЯХ картинок. Подписи исключены из
+    # BM25-текста (галлюцинации vision-модели не должны управлять
+    # ранжированием), но слова, которые существуют ТОЛЬКО на картинке
+    # («пунктуальность» на плакате про корпоративную валюту), без этого
+    # теряются совсем. Бонус бинарный по слову — по частоте его не
+    # накрутить даже зацикленной подписью. Для длинных слов префикс
+    # длиннее стандартных 5 букв, чтобы «пунктуальность» не матчилась
+    # с «пунктами меню» на скриншотах.
+    caption_bonus = [0.0] * len(lexical_records)
+    if _q_words:
+        _cap_patterns = []
+        for _w in _q_words:
+            _plen = len(_w) - 4 if len(_w) >= 10 else 5
+            _cap_patterns.append(
+                re.compile(rf"\b{re.escape(_w[:_plen])}\w*", re.IGNORECASE)
+            )
+        for i, record in enumerate(lexical_records):
+            caps = " ".join(
+                _caption_span_re.findall(record.get("text", "") or "")
+            )
+            if not caps:
+                continue
+            bonus = sum(3.0 for pat in _cap_patterns if pat.search(caps))
+            caption_bonus[i] = min(bonus, 6.0)
+
     lexical_scores = [
         score
         + filename_scores_by_id.get(record["id"], 0.0)
         + image_boost_by_id.get(record["id"], 0.0)
         + prox
-        for score, prox, record in zip(
-            bm25_scores, proximity_bonus, lexical_records
+        + cap_bonus
+        for score, prox, cap_bonus, record in zip(
+            bm25_scores, proximity_bonus, caption_bonus, lexical_records
         )
     ]
     lexical_scores_by_id = {
