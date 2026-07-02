@@ -1844,22 +1844,41 @@ def _visual_catalog_answer(
     ).lower()
 
     caption_re = re.compile(r"Изображение:\s*([^\n]+)")
+    # Эхо промта подписей: модель иногда цитирует инструкцию вместо
+    # описания («'Блок-схема' пиши ТОЛЬКО если...», «Выбор типа
+    # изображения»). Такие подписи в каталог не годятся.
+    garbage_re = re.compile(
+        r"тип[аы]?\s+изображени|пиши\s+только", re.IGNORECASE
+    )
     caption_by_file: dict[str, str] = {}
     for rec in records:
         fn = rec["filename"]
         if fn in caption_by_file:
             continue
         for cap in caption_re.findall(rec.get("text", "") or ""):
+            if garbage_re.search(cap):
+                continue
             if any(re.search(p, cap, re.IGNORECASE) for p in terms):
                 caption_by_file[fn] = cap.strip()
                 break
     if len(caption_by_file) < 2:
         return None
 
-    # Порядок: сначала файлы из выдачи retrieval (по рангу), затем остальные
-    ordered = [fn for fn in ranked_files if fn in caption_by_file]
-    ordered += sorted(fn for fn in caption_by_file if fn not in ordered)
-    ordered = ordered[:max_items]
+    # Порядок: сначала подписи, НАЧИНАЮЩИЕСЯ с искомого термина
+    # («Блок-схема порядка...») — это настоящие схемы, а не картинки,
+    # где термин упомянут вскользь («иконка блок-схемы»). Внутри групп —
+    # по рангу retrieval, затем по имени.
+    def _cap_rank(fn: str) -> int:
+        cap = caption_by_file[fn]
+        return 0 if any(
+            re.match(rf"\s*(?:{p})", cap, re.IGNORECASE) for p in terms
+        ) else 1
+
+    rank_pos = {fn: i for i, fn in enumerate(ranked_files)}
+    ordered = sorted(
+        caption_by_file,
+        key=lambda fn: (_cap_rank(fn), rank_pos.get(fn, 10_000), fn.lower()),
+    )[:max_items]
 
     lines = [
         f"Нашлось несколько документов, где есть {term_word}. Уточните "
