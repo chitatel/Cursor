@@ -729,11 +729,38 @@ async def _search_records(
             _first_term, _text_hits_by_file, _caption_hits_by_file,
             len(image_boost_by_id),
         )
+    # Бонус за фразовую близость: пары соседних слов запроса, стоящие
+    # рядом и в тексте чанка («состав тендерного комитета» одним местом),
+    # поднимают чанк над теми, где эти же слова разбросаны по разным
+    # абзацам. Критично для таблиц: их чанки длинные, BM25 штрафует их
+    # length-нормализацией, и точное попадание («Состав постоянных членов
+    # Тендерного комитета» в строке таблицы) без бонуса не долетает в топ.
+    _q_words = [
+        w for w in re.findall(r"[A-Za-zА-Яа-яЁё0-9]+", query.lower())
+        if len(w) >= 4
+    ]
+    _pair_patterns = []
+    for _a, _b in zip(_q_words, _q_words[1:]):
+        _pair_patterns.append(re.compile(
+            rf"{re.escape(_a[:5])}\w*(?:\W+\w+){{0,5}}?\W+{re.escape(_b[:5])}\w*",
+            re.IGNORECASE,
+        ))
+    proximity_bonus = [0.0] * len(lexical_records)
+    if _pair_patterns:
+        for i, text in enumerate(lexical_texts):
+            if bm25_scores[i] <= 0:
+                continue
+            bonus = sum(3.0 for pat in _pair_patterns if pat.search(text))
+            proximity_bonus[i] = min(bonus, 9.0)
+
     lexical_scores = [
         score
         + filename_scores_by_id.get(record["id"], 0.0)
         + image_boost_by_id.get(record["id"], 0.0)
-        for score, record in zip(bm25_scores, lexical_records)
+        + prox
+        for score, prox, record in zip(
+            bm25_scores, proximity_bonus, lexical_records
+        )
     ]
     lexical_scores_by_id = {
         record["id"]: float(score)
