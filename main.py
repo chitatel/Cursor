@@ -1085,6 +1085,18 @@ async def _chat(
             top_k = 30
             min_p = 0.0
             repeat_penalty = 1.15
+        # num_ctx подбираем под реальный размер промта: при переполнении
+        # Ollama МОЛЧА обрезает начало промта — первым выпадает системный
+        # промт, затем первые чанки контекста. Для русского текста
+        # ~3 символа на токен; запас — на служебные токены и ответ.
+        total_chars = sum(len(m.get("content", "") or "") for m in messages)
+        est_tokens = total_chars // 3 + max_tokens + 512
+        num_ctx = min(max(8192, ((est_tokens // 2048) + 1) * 2048), 32768)
+        if num_ctx > 8192:
+            log.info(
+                "[chat] large prompt: %d chars ≈ %d tokens → num_ctx=%d",
+                total_chars, est_tokens, num_ctx,
+            )
         payload_ollama = {
             "model": OLLAMA_LLM_MODEL,
             "messages": messages,
@@ -1097,7 +1109,7 @@ async def _chat(
                 "min_p": min_p,
                 "repeat_penalty": repeat_penalty,
                 "num_predict": max_tokens,
-                "num_ctx": 8192,
+                "num_ctx": num_ctx,
             },
         }
 
