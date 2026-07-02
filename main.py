@@ -1268,6 +1268,12 @@ def _describe_image_sync(image_path: Path) -> str:
     """
     if not IMAGE_DESCRIPTION_ENABLED:
         return ""
+    if image_path.suffix.lower() in {".emf", ".wmf", ".svg"}:
+        # Векторные форматы vision-модель не понимает (Ollama отвечает
+        # 500 Internal Server Error). Такие файлы должны конвертироваться
+        # в PNG до captioning; если сюда всё же попал вектор — молча
+        # пропускаем, не спамя ошибками.
+        return ""
     try:
         data = image_path.read_bytes()
     except Exception:
@@ -2224,6 +2230,53 @@ def _extract_emf_images_from_docx(
     return created
 
 
+def _emf_bytes_to_png(emf_data: bytes, png_path: Path) -> bool:
+    """
+    Конвертирует EMF/WMF-байты в PNG через PowerShell + System.Drawing
+    (нативно есть на Windows). Возвращает True при успехе.
+    На не-Windows системах вернёт False.
+    """
+    import subprocess
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_emf = Path(tmpdir) / "img.emf"
+        try:
+            tmp_emf.write_bytes(emf_data)
+        except Exception as e:
+            log.warning("[emf→png] tmp write failed: %s", e)
+            return False
+        ps_script = (
+            "Add-Type -AssemblyName System.Drawing; "
+            f"$img = [System.Drawing.Image]::FromFile('{tmp_emf}'); "
+            f"$img.Save('{png_path}', "
+            "[System.Drawing.Imaging.ImageFormat]::Png); "
+            "$img.Dispose()"
+        )
+        try:
+            result = subprocess.run(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-ExecutionPolicy", "Bypass",
+                    "-Command", ps_script,
+                ],
+                capture_output=True,
+                timeout=30,
+                text=True,
+            )
+        except Exception as e:
+            log.warning("[emf→png] powershell failed: %s", e)
+            return False
+        if result.returncode != 0 or not png_path.exists():
+            log.warning(
+                "[emf→png] conversion failed (rc=%s): %s",
+                result.returncode, (result.stderr or "")[:200].strip(),
+            )
+            return False
+    return True
+
+
 def _table_rows_text(table) -> str:
     """
     Превращает таблицу python-docx в текст: одна строка таблицы — одна
@@ -2433,7 +2486,6 @@ def _extract_docx_with_images(path: Path) -> list:
                     rel = doc.part.rels[embed_id]
                 except KeyError:
                     continue
-                img_counter += 1
                 img_data = rel.target_part.blob
                 content_type = rel.target_part.content_type
                 ext_map = {
@@ -2446,9 +2498,20 @@ def _extract_docx_with_images(path: Path) -> list:
                     "image/x-emf": ".emf",
                 }
                 ext = ext_map.get(content_type, ".png")
-                img_name = f"img_{img_counter:03d}{ext}"
-                img_path = images_dir / img_name
-                img_path.write_bytes(img_data)
+                next_counter = img_counter + 1
+                if ext in (".emf", ".wmf"):
+                    # EMF/WMF — векторные форматы Windows: vision-модель
+                    # на них отвечает 500, браузер их не отображает.
+                    # Конвертируем в PNG; при неудаче пропускаем картинку.
+                    img_name = f"img_{next_counter:03d}.png"
+                    img_path = images_dir / img_name
+                    if not _emf_bytes_to_png(img_data, img_path):
+                        continue
+                else:
+                    img_name = f"img_{next_counter:03d}{ext}"
+                    img_path = images_dir / img_name
+                    img_path.write_bytes(img_data)
+                img_counter = next_counter
                 marker = _build_image_marker(img_counter, img_name, img_path)
                 para_images.setdefault(para._element, []).append(marker)
                 log.info("[%s] Extracted image: %s", path.name, img_name)
