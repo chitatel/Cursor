@@ -4075,10 +4075,32 @@ async def ask(req: AskRequest, request: Request):
         if _primary_source and _primary_source in _img_chunk_counts:
             _img_source_file = _primary_source
         else:
-            _img_source_file = next(
-                (fn for fn in sources if fn in _img_chunk_counts),
-                None,
-            )
+            _img_source_file = None
+            # У primary картинка может лежать в одном-единственном чанке,
+            # который не попал в top_k (например, блок-схема в приложении
+            # в конце документа). Прежде чем отдавать картинки документу №2,
+            # проверяем ИНДЕКС primary-документа: если картинки там есть,
+            # источник — всё равно primary (его image-чанки подтянутся ниже).
+            if _primary_source:
+                try:
+                    _primary_recs = await _document_records(_primary_source)
+                except Exception:
+                    _primary_recs = []
+                if any(
+                    img_marker_re.search(rec.get("text", "") or "")
+                    for rec in _primary_recs
+                ):
+                    _img_source_file = _primary_source
+                    log.info(
+                        "[attach_images] primary %s has images in index "
+                        "(none in top_k) — using primary as image source",
+                        _primary_source,
+                    )
+            if _img_source_file is None:
+                _img_source_file = next(
+                    (fn for fn in sources if fn in _img_chunk_counts),
+                    None,
+                )
 
         # Глобальный fallback: ни один документ из top_k не имеет картинок
         # в выдаче (например, картинка лежит только в конце документа,
