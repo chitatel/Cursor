@@ -607,7 +607,7 @@ def _rrf_fusion(
 # каталожного ответа на навигационные запросы в /ask.
 _VISUAL_TERMS = [
     r"блок[-\s]?схем",
-    r"\bсхем[аеы]",
+    r"\bсхем",
     r"диаграмм",
     r"инфографик",
 ]
@@ -1844,40 +1844,82 @@ def _visual_catalog_answer(
     ).lower()
 
     caption_re = re.compile(r"Изображение:\s*([^\n]+)")
+    marker_re = re.compile(r"\[Рисунок\s+\d+:")
     # Эхо промта подписей: модель иногда цитирует инструкцию вместо
     # описания («'Блок-схема' пиши ТОЛЬКО если...», «Выбор типа
-    # изображения»). Такие подписи в каталог не годятся.
+    # изображения», «ПРОЦИТИРУЙ дословно»). В каталог не годятся.
     garbage_re = re.compile(
-        r"тип[аы]?\s+изображени|пиши\s+только", re.IGNORECASE
+        r"тип[аы]?\s+изображени|пиши\s+только|процитируй", re.IGNORECASE
     )
+    # Кандидаты собираем из двух источников:
+    # 1) подпись картинки с термином — vision-модель распознала схему;
+    # 2) строка ТЕКСТА документа с термином (заголовок вида «Приложение А.
+    #    Блок-схема порядка...») у файла с картинками — настоящие
+    #    Visio-схемы часто описаны моделью другими словами, но названы
+    #    схемами в самом документе.
     caption_by_file: dict[str, str] = {}
+    text_line_by_file: dict[str, str] = {}
+    files_with_images: set[str] = set()
     for rec in records:
         fn = rec["filename"]
-        if fn in caption_by_file:
+        text = rec.get("text", "") or ""
+        if marker_re.search(text):
+            files_with_images.add(fn)
+        if fn not in caption_by_file:
+            for cap in caption_re.findall(text):
+                if garbage_re.search(cap):
+                    continue
+                if any(re.search(p, cap, re.IGNORECASE) for p in terms):
+                    caption_by_file[fn] = cap.strip()
+                    break
+        if fn not in text_line_by_file:
+            for line in caption_re.sub(" ", text).split("\n"):
+                line = line.strip()
+                if len(line) < 12 or line.startswith("[Рисунок"):
+                    continue
+                if any(re.search(p, line, re.IGNORECASE) for p in terms):
+                    text_line_by_file[fn] = line
+                    break
+
+    def _norm_desc(s: str) -> str:
+        # «Приложение А. Блок-схема...» → «Блок-схема...»
+        return re.sub(
+            r"^приложение\s+[А-Яа-яA-Za-z0-9]{1,3}[.:\s—-]*", "",
+            s.strip(), flags=re.IGNORECASE,
+        ).strip()
+
+    def _starts_with_term(s: str) -> bool:
+        return any(re.match(rf"\s*(?:{p})", s, re.IGNORECASE) for p in terms)
+
+    desc_by_file: dict[str, str] = {}
+    for fn in (set(caption_by_file) | set(text_line_by_file)):
+        if fn not in files_with_images:
             continue
-        for cap in caption_re.findall(rec.get("text", "") or ""):
-            if garbage_re.search(cap):
-                continue
-            if any(re.search(p, cap, re.IGNORECASE) for p in terms):
-                caption_by_file[fn] = cap.strip()
-                break
-    if len(caption_by_file) < 2:
+        options = []
+        if fn in caption_by_file:
+            options.append(_norm_desc(caption_by_file[fn]))
+        if fn in text_line_by_file:
+            options.append(_norm_desc(text_line_by_file[fn]))
+        options = [o for o in options if o]
+        if not options:
+            continue
+        starts = [o for o in options if _starts_with_term(o)]
+        desc_by_file[fn] = (starts or options)[0]
+    if len(desc_by_file) < 2:
         return None
 
-    # Порядок: сначала подписи, НАЧИНАЮЩИЕСЯ с искомого термина
+    # Порядок: сначала описания, НАЧИНАЮЩИЕСЯ с искомого термина
     # («Блок-схема порядка...») — это настоящие схемы, а не картинки,
     # где термин упомянут вскользь («иконка блок-схемы»). Внутри групп —
     # по рангу retrieval, затем по имени.
-    def _cap_rank(fn: str) -> int:
-        cap = caption_by_file[fn]
-        return 0 if any(
-            re.match(rf"\s*(?:{p})", cap, re.IGNORECASE) for p in terms
-        ) else 1
-
     rank_pos = {fn: i for i, fn in enumerate(ranked_files)}
     ordered = sorted(
-        caption_by_file,
-        key=lambda fn: (_cap_rank(fn), rank_pos.get(fn, 10_000), fn.lower()),
+        desc_by_file,
+        key=lambda fn: (
+            0 if _starts_with_term(desc_by_file[fn]) else 1,
+            rank_pos.get(fn, 10_000),
+            fn.lower(),
+        ),
     )[:max_items]
 
     lines = [
@@ -1888,7 +1930,7 @@ def _visual_catalog_answer(
     suggested: list[str] = []
     for fn in ordered:
         title, refine = _catalog_title_and_refine(fn)
-        cap = caption_by_file[fn]
+        cap = desc_by_file[fn]
         if len(cap) > 160:
             cap = cap[:160].rsplit(" ", 1)[0] + "…"
         sq = f"{term_word} {refine}".strip() if refine else term_word
