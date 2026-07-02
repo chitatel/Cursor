@@ -666,7 +666,19 @@ async def _search_records(
     else:
         lexical_records = records
     lexical_fetch_k = min(max(top_k * 8, 12), len(lexical_records))
-    lexical_texts = [f"{record['filename']} {record['text']}" for record in lexical_records]
+    # Подписи картинок («Изображение: ...» перед маркером [Рисунок N])
+    # ИСКЛЮЧАЮТСЯ из BM25-текста: vision-модель галлюцинирует (называет
+    # скриншоты 1С «блок-схемами», зацикливается), и эти слова не должны
+    # влиять на ранжирование документов. Подписи нужны для привязки
+    # картинок к пунктам ответа; для поиска они учитываются только
+    # отдельным адресным boost ниже.
+    _caption_span_re = re.compile(
+        r"Изображение:.*?(?=\[Рисунок\s+\d+:|\n\n|\Z)", re.DOTALL
+    )
+    lexical_texts = [
+        f"{record['filename']} {_caption_span_re.sub(' ', record['text'])}"
+        for record in lexical_records
+    ]
     bm25_scores = _bm25_scores(query, lexical_texts)
     filename_scores_by_id = {
         record["id"]: _filename_match_boost(query, record["filename"])
@@ -689,28 +701,33 @@ async def _search_records(
     ]
     image_boost_by_id: dict[str, float] = {}
     if query_visual_terms:
-        image_marker_re = re.compile(r"\[Рисунок\s+\d+:\s*([^\]]+)\]")
-        # Диагностика: где вообще встречается визуальный термин запроса
-        _term_hits_by_file: dict[str, int] = {}
+        # Диагностика: раздельные счётчики — термин в тексте документа
+        # (без подписей) и термин в подписях картинок.
+        _text_hits_by_file: dict[str, int] = {}
+        _caption_hits_by_file: dict[str, int] = {}
         _first_term = query_visual_terms[0]
         for record in lexical_records:
+            fn = record["filename"]
             text = record.get("text", "")
-            n_hits = len(re.findall(_first_term, text, re.IGNORECASE))
-            if n_hits:
-                fn = record["filename"]
-                _term_hits_by_file[fn] = _term_hits_by_file.get(fn, 0) + n_hits
-            captions = image_marker_re.findall(text)
-            if not captions:
-                continue
+            captions = _caption_span_re.findall(text)
             caption_text = " ".join(captions)
-            if any(
+            doc_text = _caption_span_re.sub(" ", text)
+            n_text = len(re.findall(_first_term, doc_text, re.IGNORECASE))
+            n_cap = len(re.findall(_first_term, caption_text, re.IGNORECASE))
+            if n_text:
+                _text_hits_by_file[fn] = _text_hits_by_file.get(fn, 0) + n_text
+            if n_cap:
+                _caption_hits_by_file[fn] = _caption_hits_by_file.get(fn, 0) + n_cap
+            if caption_text and any(
                 re.search(p, caption_text, re.IGNORECASE)
                 for p in query_visual_terms
             ):
                 image_boost_by_id[record["id"]] = 10.0
         log.info(
-            "[visual-query] term %r occurrences by file: %s; boosted chunks: %d",
-            _first_term, _term_hits_by_file, len(image_boost_by_id),
+            "[visual-query] term %r in doc text: %s; in captions: %s; "
+            "boosted chunks: %d",
+            _first_term, _text_hits_by_file, _caption_hits_by_file,
+            len(image_boost_by_id),
         )
     lexical_scores = [
         score
